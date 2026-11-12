@@ -22,8 +22,8 @@ well.
 Albums are grouped by album artist (or artist) and album. Opening an album or a folder
 shows its tracks on the left, with `all` on top: editing a field there writes it to every
 track (Filename, Title and Track number only show track by track). A field whose tracks disagree
-shows `<various>`. Filenames are read-only, and custom fields (`tidal_*`, `upc`, …) are
-not shown but are kept on save.
+shows `<various>`. Filenames are read-only, and custom fields (`tidal_*`, `upc`, …), encoder, ISRC and
+replay gain are not shown but are kept on save.
 
 The cover is drawn with the terminal's graphics protocol (kitty, sixel…) through
 [ratatui-image], or with half blocks elsewhere. `c` embeds the folder's `cover.jpg` /

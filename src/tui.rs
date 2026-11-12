@@ -30,6 +30,15 @@ const COVER: Size = Size::new(20, 10);
 /// Fields that differ per track by nature: not edited for a whole album at once.
 /// Fields the "all" row hides: they only make sense track by track.
 const PER_TRACK: [ItemKey; 2] = [ItemKey::TrackNumber, ItemKey::TrackTitle];
+/// Standard fields never shown (kept on save like custom ones).
+const HIDDEN: [ItemKey; 6] = [
+    ItemKey::EncoderSoftware,
+    ItemKey::Isrc,
+    ItemKey::ReplayGainAlbumGain,
+    ItemKey::ReplayGainAlbumPeak,
+    ItemKey::ReplayGainTrackGain,
+    ItemKey::ReplayGainTrackPeak,
+];
 const VARIOUS: &str = "<various>";
 
 pub fn run(root: PathBuf) -> Result<()> {
@@ -963,7 +972,7 @@ fn find(entries: &[String], query: &str, from: usize, forward: bool) -> Option<u
 }
 
 /// The field list for a selection: Filename (`None`), `MAIN`, `MORE`, then every other
-/// standard field the selected tracks have, by label. `all` (the "all" row) leaves out
+/// standard field the selected tracks have (but `HIDDEN`), by label. `all` (the "all" row) leaves out
 /// Filename and `PER_TRACK`.
 fn field_rows(sel: &[Track], all: bool) -> Vec<Option<ItemKey>> {
     let listed = |k: &ItemKey| MAIN.iter().chain(&MORE).any(|(m, _)| m == k);
@@ -971,7 +980,7 @@ fn field_rows(sel: &[Track], all: bool) -> Vec<Option<ItemKey>> {
         .iter()
         .flat_map(|t| t.draft.keys().chain(t.saved.keys()))
         .copied()
-        .filter(|k| !listed(k))
+        .filter(|k| !listed(k) && !HIDDEN.contains(k))
         .collect();
     extra.sort_by_key(|k| tags::label(*k));
     extra.dedup();
@@ -1468,5 +1477,18 @@ mod tests {
         assert_eq!(info[2], "320–900 kbps");
         assert_eq!(audio_info(&tracks[..1])[1], "16 bit · 44.1 kHz");
         std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn hidden_fields_are_not_listed() {
+        let mut t = Track::load(&Path::new(FIXTURES).join("tiny.flac")).unwrap();
+        t.saved.insert(ItemKey::Isrc, "USX9P0000001".into());
+        t.draft
+            .insert(ItemKey::ReplayGainTrackGain, "-6.5 dB".into());
+        t.draft.insert(ItemKey::Label, "ECM".into());
+        let rows = field_rows(std::slice::from_ref(&t), false);
+        assert!(rows.contains(&Some(ItemKey::Label)));
+        assert!(!rows.contains(&Some(ItemKey::Isrc)));
+        assert!(!rows.contains(&Some(ItemKey::ReplayGainTrackGain)));
     }
 }
