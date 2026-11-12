@@ -10,17 +10,23 @@ use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
+use image::imageops::FilterType;
 use lofty::tag::ItemKey;
 use ratatui::backend::CrosstermBackend;
-use ratatui::layout::{Constraint, Layout, Rect};
+use ratatui::layout::{Constraint, Layout, Rect, Size};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
     Block, Borders, Cell, List, ListItem, ListState, Paragraph, Row as TableRow, Table, TableState,
 };
+use ratatui_image::picker::Picker;
+use ratatui_image::protocol::Protocol;
+use ratatui_image::{Image, Resize};
 use std::io::{stdout, Stdout};
 use std::path::{Path, PathBuf};
 
+/// Cover box in cells; about square with the usual 1:2 cell shape.
+const COVER: Size = Size::new(20, 10);
 /// Fields that differ per track by nature: not edited for a whole album at once.
 const PER_TRACK: [ItemKey; 2] = [ItemKey::TrackNumber, ItemKey::TrackTitle];
 /// Index of the first `MORE` field in the field list (after Filename and `MAIN`).
@@ -29,10 +35,12 @@ const VARIOUS: &str = "<various>";
 
 pub fn run(root: PathBuf) -> Result<()> {
     let _session = TerminalSession::enter(CrosstermTerminalOps)?;
+    // Asks the terminal for its graphics protocol (kitty, sixel…) and font size.
+    let picker = Picker::from_query_stdio().unwrap_or_else(|_| Picker::halfblocks());
     let mut terminal = ratatui::Terminal::new(CrosstermBackend::new(stdout()))?;
     let scanning = format!("scanning {}…", root.display());
     terminal.draw(|f| f.render_widget(Paragraph::new(scanning.as_str()), f.area()))?;
-    App::new(root).event_loop(&mut terminal)
+    App::new(root, picker).event_loop(&mut terminal)
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -56,6 +64,13 @@ struct Input {
     cursor: usize,
 }
 
+/// The decoded cover on show.
+struct Cover {
+    bytes: Vec<u8>,
+    size: Option<(u32, u32)>,
+    protocol: Option<Protocol>,
+}
+
 struct App {
     screen: Screen,
     rows: Vec<Row>,
@@ -73,10 +88,12 @@ struct App {
     confirm: bool,
     armed: bool,
     status: String,
+    picker: Picker,
+    cover: Option<Cover>,
 }
 
 impl App {
-    fn new(root: PathBuf) -> Self {
+    fn new(root: PathBuf, picker: Picker) -> Self {
         let rows = library::scan(&root);
         let albums = library::albums(&rows);
         let status = format!("{} tracks in {} albums", rows.len(), albums.len());
@@ -94,6 +111,8 @@ impl App {
             confirm: false,
             armed: false,
             status,
+            picker,
+            cover: None,
         }
     }
 
@@ -242,6 +261,7 @@ impl App {
             from: self.screen,
         });
         self.screen = Screen::Editor;
+        self.update_cover();
     }
 
     fn selection(&self) -> &[Track] {
@@ -296,6 +316,7 @@ impl App {
                     t.discard();
                 }
                 self.status = "dropped unsaved changes".into();
+                self.update_cover();
             }
             _ => {}
         }
@@ -303,6 +324,7 @@ impl App {
 
     fn track_changed(&mut self) {
         self.field = self.field.min(field_rows(self.selection()).len() - 1);
+        self.update_cover();
     }
 
     /// Why the selected field can't be edited for the current selection, if it can't.
@@ -428,6 +450,30 @@ impl App {
         if let Some(i) = self.albums.iter().position(|a| a.tracks.contains(&first)) {
             self.album_cursor = i;
         }
+        self.update_cover();
+    }
+
+    /// Decode the cover the selection shows, when it changed.
+    fn update_cover(&mut self) {
+        let (shown, _) = shown_cover(self.selection());
+        if shown == self.cover.as_ref().map(|c| c.bytes.as_slice()) {
+            return;
+        }
+        let Some(bytes) = shown.map(<[u8]>::to_vec) else {
+            self.cover = None;
+            return;
+        };
+        let decoded = image::load_from_memory(&bytes).ok();
+        let size = decoded.as_ref().map(|i| (i.width(), i.height()));
+        let protocol = decoded.and_then(|img| {
+            let fit = Resize::Fit(Some(FilterType::Triangle));
+            self.picker.new_protocol(img, COVER, fit).ok()
+        });
+        self.cover = Some(Cover {
+            bytes,
+            size,
+            protocol,
+        });
     }
 
     fn draw(&self, f: &mut ratatui::Frame) {
@@ -552,12 +598,41 @@ impl App {
         let block = Block::default().borders(Borders::ALL).title(title);
         let inner = block.inner(right);
         f.render_widget(block, right);
-        let [info_area, fields_area] =
-            Layout::vertical([Constraint::Length(4), Constraint::Min(1)]).areas(inner);
+        let [top, fields_area] =
+            Layout::vertical([Constraint::Length(COVER.height + 1), Constraint::Min(1)])
+                .areas(inner);
+        let [cover_area, info_area] =
+            Layout::horizontal([Constraint::Length(COVER.width + 2), Constraint::Min(1)])
+                .areas(top);
 
         let sel = self.selection();
-        let info: Vec<Line> = audio_info(sel).into_iter().map(Line::from).collect();
+        let (_, same_cover) = shown_cover(sel);
+        let cover_text = match &self.cover {
+            None => "no cover".to_string(),
+            Some(c) => {
+                let size = c
+                    .size
+                    .map_or("unreadable".into(), |(w, h)| format!("{w}×{h}"));
+                let new = if sel.iter().any(|t| t.new_cover.is_some()) {
+                    " (new, unsaved)"
+                } else {
+                    ""
+                };
+                let differ = if same_cover { "" } else { ", covers differ" };
+                format!("cover {size}{new}{differ}")
+            }
+        };
+        let mut info: Vec<Line> = audio_info(sel).into_iter().map(Line::from).collect();
+        info.push(Line::from(Span::styled(
+            cover_text,
+            Style::default().fg(Color::DarkGray),
+        )));
         f.render_widget(Paragraph::new(info), info_area);
+        if let Some(protocol) = self.cover.as_ref().and_then(|c| c.protocol.as_ref()) {
+            let area = Rect::new(cover_area.x, cover_area.y, COVER.width, COVER.height)
+                .intersection(cover_area);
+            f.render_widget(Image::new(protocol), area);
+        }
 
         let rows = field_rows(sel);
         let focus = !self.focus_tracks;
@@ -649,6 +724,16 @@ fn field_rows(sel: &[Track]) -> Vec<Option<ItemKey>> {
         .chain(MAIN.iter().chain(&MORE).map(|(k, _)| Some(*k)))
         .chain(extra.into_iter().map(Some))
         .collect()
+}
+
+/// The cover the selection shows (the new one if staged) and whether every selected
+/// track has that same cover.
+fn shown_cover(sel: &[Track]) -> (Option<&[u8]>, bool) {
+    fn cover(t: &Track) -> Option<&[u8]> {
+        t.new_cover.as_deref().or(t.cover.as_deref())
+    }
+    let first = sel.first().and_then(cover);
+    (first, sel.iter().all(|t| cover(t) == first))
 }
 
 /// Format, quality and bitrate lines; ranges when the tracks differ.
@@ -935,7 +1020,7 @@ mod tests {
     #[test]
     fn batch_edit_an_album_and_save() {
         let root = library("batch");
-        let mut app = App::new(root.clone());
+        let mut app = App::new(root.clone(), Picker::halfblocks());
         assert_eq!(app.albums.len(), 1);
 
         press(&mut app, "\n"); // open the album, "all" selected, field Artist
@@ -965,7 +1050,7 @@ mod tests {
     #[test]
     fn per_track_edit_and_various() {
         let root = library("track");
-        let mut app = App::new(root.clone());
+        let mut app = App::new(root.clone(), Picker::halfblocks());
         press(&mut app, "\nhj\njjj\n\x08\x08\x08\x08Intro\n"); // track 1 title
         assert_eq!(app.selection().len(), 1);
         press(&mut app, "hk"); // back to "all"
@@ -997,7 +1082,7 @@ mod tests {
     #[test]
     fn folders_open_the_folder_at_a_track() {
         let root = library("folders");
-        let mut app = App::new(root.clone());
+        let mut app = App::new(root.clone(), Picker::halfblocks());
         app.key(KeyEvent::from(KeyCode::Tab));
         assert_eq!(app.screen, Screen::Folders);
         press(&mut app, "ljj\n"); // expand Album, go to its second file
