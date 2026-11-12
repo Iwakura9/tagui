@@ -63,8 +63,7 @@ pub fn run(root: PathBuf) -> Result<()> {
     terminal.draw(|f| f.render_widget(Paragraph::new(scanning.as_str()), f.area()))?;
     let mut app = App::new(root, picker);
     app.apply(&config::load());
-    app.event_loop(&mut terminal)?;
-    config::save(&app.settings())
+    app.event_loop(&mut terminal)
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -328,7 +327,15 @@ impl App {
         &mut self,
         terminal: &mut ratatui::Terminal<CrosstermBackend<Stdout>>,
     ) -> Result<()> {
+        let mut saved = self.settings();
         'draw: loop {
+            // Written as soon as they change: closing the terminal never reaches the end of `run`.
+            if self.settings() != saved {
+                saved = self.settings();
+                if let Err(e) = config::save(&saved) {
+                    self.status = format!("{e:#}");
+                }
+            }
             terminal.draw(|f| self.draw(f))?;
             // While covers are loading, wake up to show them as they come.
             while self.loading > 0 && !event::poll(Duration::from_millis(30))? {
