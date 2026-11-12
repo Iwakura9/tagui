@@ -27,6 +27,9 @@ use ratatui_image::{Image, Resize};
 use std::collections::{BTreeSet, HashMap};
 use std::io::{stdout, Stdout};
 use std::path::{Path, PathBuf};
+use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 /// Cover box in cells; about square with the usual 1:2 cell shape.
 const COVER: Size = Size::new(20, 10);
@@ -159,6 +162,40 @@ struct Cover {
     protocol: Option<Protocol>,
 }
 
+/// An album cover at a size: the album's first track and the size in cells.
+type ThumbKey = (PathBuf, Size);
+
+/// Workers that decode album covers off the UI thread (decoding a 1400 px JPEG takes
+/// ~12 ms): keys in, protocols out. They stop when the job sender is dropped.
+// ponytail: FIFO, so a fast scroll decodes every album it passes; drop stale jobs if it lags.
+fn thumb_workers(picker: &Picker) -> (Sender<ThumbKey>, Receiver<(ThumbKey, Option<Protocol>)>) {
+    let (jobs, queue) = mpsc::channel::<ThumbKey>();
+    let (done, results) = mpsc::channel();
+    let queue = Arc::new(Mutex::new(queue));
+    let workers = std::thread::available_parallelism().map_or(2, |n| n.get().min(4));
+    for _ in 0..workers {
+        let (queue, done, picker) = (queue.clone(), done.clone(), picker.clone());
+        std::thread::spawn(move || loop {
+            let Ok(key) = queue
+                .lock()
+                .map_err(drop)
+                .and_then(|q| q.recv().map_err(drop))
+            else {
+                return;
+            };
+            let thumb = tags::cover(&key.0).and_then(|bytes| {
+                let img = image::load_from_memory(&bytes).ok()?;
+                let fit = Resize::Fit(Some(FilterType::Triangle));
+                picker.new_protocol(img, key.1, fit).ok()
+            });
+            if done.send((key, thumb)).is_err() {
+                return;
+            }
+        });
+    }
+    (jobs, results)
+}
+
 struct App {
     screen: Screen,
     rows: Vec<Row>,
@@ -172,9 +209,12 @@ struct App {
     /// Albums per line and per screen at the last draw, for the keys that move by them.
     tile_cols: usize,
     tile_page: usize,
-    /// Album covers by first track and size; None when there is none to show.
-    // ponytail: decoded synchronously while drawing; thread it if scrolling stutters.
-    thumbs: HashMap<(PathBuf, Size), Option<Protocol>>,
+    /// Album covers by first track and size; None while loading or when there is none.
+    thumbs: HashMap<ThumbKey, Option<Protocol>>,
+    /// Covers asked from the workers (`thumb_workers`) and not back yet.
+    thumb_jobs: Sender<ThumbKey>,
+    thumb_done: Receiver<(ThumbKey, Option<Protocol>)>,
+    loading: usize,
     tree: Tree,
     open: Option<Open>,
     /// 0 = all tracks, 1.. = `tracks[track - 1]`.
@@ -203,6 +243,7 @@ impl App {
             rows.len(),
             albums.len()
         );
+        let (thumb_jobs, thumb_done) = thumb_workers(&picker);
         Self {
             screen: Screen::Albums,
             rows,
@@ -214,6 +255,9 @@ impl App {
             tile_cols: 1,
             tile_page: 10,
             thumbs: HashMap::new(),
+            thumb_jobs,
+            thumb_done,
+            loading: 0,
             tree: Tree::new(root),
             open: None,
             track: 0,
@@ -276,8 +320,14 @@ impl App {
         &mut self,
         terminal: &mut ratatui::Terminal<CrosstermBackend<Stdout>>,
     ) -> Result<()> {
-        loop {
+        'draw: loop {
             terminal.draw(|f| self.draw(f))?;
+            // While covers are loading, wake up to show them as they come.
+            while self.loading > 0 && !event::poll(Duration::from_millis(30))? {
+                if self.receive_thumbs() {
+                    continue 'draw;
+                }
+            }
             let Event::Key(key) = event::read()? else {
                 continue;
             };
@@ -1160,18 +1210,27 @@ impl App {
         }
     }
 
-    /// Album `i`'s cover fit to `size`, decoded on first use.
+    /// Album `i`'s cover fit to `size`; asks the workers for it on first use.
     fn thumb(&mut self, i: usize, size: Size) -> Option<&Protocol> {
-        let path = self.albums.get(i)?.tracks.first()?.clone();
-        let picker = &self.picker;
-        self.thumbs
-            .entry((path, size))
-            .or_insert_with_key(|(path, _)| {
-                let img = image::load_from_memory(&tags::cover(path)?).ok()?;
-                let fit = Resize::Fit(Some(FilterType::Triangle));
-                picker.new_protocol(img, size, fit).ok()
-            })
-            .as_ref()
+        let key = (self.albums.get(i)?.tracks.first()?.clone(), size);
+        if !self.thumbs.contains_key(&key) {
+            self.thumbs.insert(key.clone(), None);
+            if self.thumb_jobs.send(key.clone()).is_ok() {
+                self.loading += 1;
+            }
+        }
+        self.thumbs[&key].as_ref()
+    }
+
+    /// Take the covers the workers finished; true when any arrived.
+    fn receive_thumbs(&mut self) -> bool {
+        let mut any = false;
+        while let Ok((key, thumb)) = self.thumb_done.try_recv() {
+            self.loading -= 1;
+            self.thumbs.insert(key, thumb);
+            any = true;
+        }
+        any
     }
 
     fn draw_tree(&self, f: &mut ratatui::Frame, area: Rect) {
@@ -1861,6 +1920,14 @@ mod tests {
         let screen = screen_text(&mut app);
         assert!(screen.contains("· rows "));
         assert!(screen.contains("Album Artist · 3 tracks"));
+        assert!(app.loading > 0);
+        for _ in 0..200 {
+            app.receive_thumbs();
+            if app.loading == 0 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
         assert!(app.thumbs.values().all(Option::is_some) && !app.thumbs.is_empty());
         press(&mut app, "vv");
         assert!(screen_text(&mut app).contains("· compact "));
