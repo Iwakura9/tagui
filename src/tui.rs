@@ -66,6 +66,9 @@ struct App {
     field: usize,
     focus_tracks: bool,
     editing: Option<Input>,
+    /// An action that would drop unsaved edits asked once and waits for its repeat.
+    confirm: bool,
+    armed: bool,
     status: String,
 }
 
@@ -84,6 +87,8 @@ impl App {
             field: 1,
             focus_tracks: false,
             editing: None,
+            confirm: false,
+            armed: false,
             status,
         }
     }
@@ -103,8 +108,26 @@ impl App {
         }
     }
 
+    fn dirty(&self) -> bool {
+        self.open
+            .as_ref()
+            .is_some_and(|o| o.tracks.iter().any(Track::dirty))
+    }
+
+    /// Whether an action that drops unsaved edits may go ahead: yes when nothing is
+    /// unsaved or when it is the repeat of the key that just warned.
+    fn may_drop_draft(&mut self, what: &str) -> bool {
+        if !self.dirty() || self.armed {
+            return true;
+        }
+        self.confirm = true;
+        self.status = format!("unsaved changes: {what} again to drop them, Ctrl+s to save");
+        false
+    }
+
     /// Handle one key press; true means quit.
     fn key(&mut self, key: KeyEvent) -> bool {
+        self.armed = std::mem::take(&mut self.confirm);
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         let ctrl_c = ctrl && key.code == KeyCode::Char('c');
         // While typing, keys belong to the input (letters must not trigger shortcuts).
@@ -113,7 +136,7 @@ impl App {
             return false;
         }
         if ctrl_c || key.code == KeyCode::Char('q') {
-            return true;
+            return self.may_drop_draft("q");
         }
         match key.code {
             KeyCode::Tab => {
@@ -184,6 +207,9 @@ impl App {
     }
 
     fn open_tracks(&mut self, paths: &[PathBuf], title: String, select: Option<&Path>) {
+        if !self.may_drop_draft("Enter") {
+            return;
+        }
         let mut tracks = Vec::new();
         let mut failed = 0;
         for path in paths {
