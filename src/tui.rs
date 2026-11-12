@@ -311,6 +311,7 @@ impl App {
             KeyCode::Down | KeyCode::Char('j') => self.field = (self.field + 1) % fields,
             KeyCode::Enter => self.start_edit(),
             KeyCode::Char('d') => self.clear_field(),
+            KeyCode::Char('c') => self.stage_cover(),
             KeyCode::Char('u') => {
                 for t in self.open.iter_mut().flat_map(|o| &mut o.tracks) {
                     t.discard();
@@ -417,6 +418,31 @@ impl App {
             }
             self.status = format!("cleared {}", tags::label(key));
         }
+    }
+
+    /// Stage each selected track's folder cover (cover.jpg/.jpeg/.png) as its new cover.
+    fn stage_cover(&mut self) {
+        let (mut staged, mut missing) = (0, 0);
+        for t in self.selection_mut() {
+            let dir = t.path.parent().unwrap_or(Path::new(""));
+            let Some(bytes) = tags::folder_cover(dir).and_then(|p| std::fs::read(p).ok()) else {
+                missing += 1;
+                continue;
+            };
+            if image::guess_format(&bytes).is_err() {
+                missing += 1;
+            } else if t.cover.as_ref() != Some(&bytes) {
+                t.new_cover = Some(bytes);
+                staged += 1;
+            }
+        }
+        self.status = match (staged, missing) {
+            (0, 0) => "the folder cover is already embedded".into(),
+            (0, _) => "no cover.jpg / cover.png in the folder".into(),
+            (n, 0) => format!("folder cover staged for {n} track(s): Ctrl+s writes it"),
+            (n, m) => format!("folder cover staged for {n} track(s), {m} without one"),
+        };
+        self.update_cover();
     }
 
     fn save(&mut self) {
@@ -976,7 +1002,8 @@ mod tests {
 
     const FIXTURES: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures");
 
-    /// A library with one album (the three fixtures share their tags).
+    /// A library with one album (the three fixtures share their tags) whose folder
+    /// cover differs from the embedded one.
     fn library(test: &str) -> PathBuf {
         let root = std::env::temp_dir().join(format!("tagui-tui-{}-{test}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
@@ -984,6 +1011,11 @@ mod tests {
         for f in ["tiny.flac", "tiny.mp3", "tiny.m4a"] {
             std::fs::copy(Path::new(FIXTURES).join(f), root.join("Album").join(f)).unwrap();
         }
+        std::fs::copy(
+            Path::new(FIXTURES).join("other.jpg"),
+            root.join("Album/cover.jpg"),
+        )
+        .unwrap();
         root
     }
 
@@ -1036,12 +1068,17 @@ mod tests {
         assert!(app.dirty());
         assert!(screen_text(&app).contains("Jazz"));
 
+        press(&mut app, "c"); // folder cover differs from the embedded one
+        assert!(app.selection().iter().all(|t| t.new_cover.is_some()));
+
         assert!(!press(&mut app, "q"), "first q only warns");
         ctrl_s(&mut app);
         assert!(!app.dirty(), "{}", app.status);
+        let cover = std::fs::read(root.join("Album/cover.jpg")).unwrap();
         for f in ["tiny.flac", "tiny.mp3", "tiny.m4a"] {
             let t = Track::load(&root.join("Album").join(f)).unwrap();
             assert_eq!(tags::get(&t.saved, ItemKey::Genre), "Jazz", "{f}");
+            assert_eq!(t.cover.as_ref(), Some(&cover), "{f}");
         }
         assert!(press(&mut app, "q"), "nothing unsaved: q quits");
         std::fs::remove_dir_all(&root).unwrap();
