@@ -149,6 +149,7 @@ pub struct Row {
     /// Album artist, or artist when there is none.
     pub artist: String,
     pub album: String,
+    pub title: String,
     pub disc: u32,
     pub track: u32,
     /// Every genre, and every artist and album artist, one name per entry.
@@ -197,6 +198,7 @@ pub fn row(path: &Path) -> Option<Row> {
         path: path.to_path_buf(),
         artist: artist.to_string(),
         album: text(ItemKey::AlbumTitle).to_string(),
+        title: text(ItemKey::TrackTitle).to_string(),
         disc: number(ItemKey::DiscNumber),
         track: number(ItemKey::TrackNumber),
         genres: names(ItemKey::Genre).collect(),
@@ -358,6 +360,7 @@ mod tests {
             path: path.into(),
             artist: artist.into(),
             album: album.into(),
+            title: String::new(),
             disc,
             track,
             genres: vec![],
