@@ -287,6 +287,7 @@ impl App {
             KeyCode::Up | KeyCode::Char('k') => self.field = (self.field + fields - 1) % fields,
             KeyCode::Down | KeyCode::Char('j') => self.field = (self.field + 1) % fields,
             KeyCode::Enter => self.start_edit(),
+            KeyCode::Char('d') => self.clear_field(),
             _ => {}
         }
     }
@@ -371,6 +372,19 @@ impl App {
         }
         for t in self.selection_mut() {
             t.draft.insert(key, text.clone());
+        }
+    }
+
+    fn clear_field(&mut self) {
+        if let Some(why) = self.locked() {
+            self.status = why;
+            return;
+        }
+        if let Some(key) = self.selected_key() {
+            for t in self.selection_mut() {
+                t.draft.insert(key, String::new());
+            }
+            self.status = format!("cleared {}", tags::label(key));
         }
     }
 
