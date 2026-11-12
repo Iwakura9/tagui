@@ -3,19 +3,27 @@
 //! Edits stay in each track's draft; files change only on Ctrl+s.
 
 use crate::library::{self, Album, Tree};
+use crate::tags::{self, Track, MAIN, MORE};
 use anyhow::Result;
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
+use lofty::tag::ItemKey;
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph};
+use ratatui::widgets::{
+    Block, Borders, Cell, List, ListItem, ListState, Paragraph, Row as TableRow, Table, TableState,
+};
 use std::io::{stdout, Stdout};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+
+/// Index of the first `MORE` field in the field list (after Filename and `MAIN`).
+const FIRST_MORE: usize = 1 + MAIN.len();
+const VARIOUS: &str = "<various>";
 
 pub fn run(root: PathBuf) -> Result<()> {
     let _session = TerminalSession::enter(CrosstermTerminalOps)?;
@@ -29,6 +37,15 @@ pub fn run(root: PathBuf) -> Result<()> {
 enum Screen {
     Albums,
     Folders,
+    Editor,
+}
+
+/// The album or folder in the editor.
+struct Open {
+    title: String,
+    tracks: Vec<Track>,
+    /// Where Esc goes back to.
+    from: Screen,
 }
 
 struct App {
@@ -36,6 +53,12 @@ struct App {
     albums: Vec<Album>,
     album_cursor: usize,
     tree: Tree,
+    open: Option<Open>,
+    /// 0 = all tracks, 1.. = `tracks[track - 1]`.
+    track: usize,
+    /// Index into `field_rows(selection)`.
+    field: usize,
+    focus_tracks: bool,
     status: String,
 }
 
@@ -49,6 +72,10 @@ impl App {
             albums,
             album_cursor: 0,
             tree: Tree::new(root),
+            open: None,
+            track: 0,
+            field: 1,
+            focus_tracks: false,
             status,
         }
     }
@@ -79,12 +106,14 @@ impl App {
             KeyCode::Tab => {
                 self.screen = match self.screen {
                     Screen::Albums => Screen::Folders,
+                    Screen::Folders if self.open.is_some() => Screen::Editor,
                     _ => Screen::Albums,
                 }
             }
             code => match self.screen {
                 Screen::Albums => self.albums_key(code),
                 Screen::Folders => self.folders_key(code),
+                Screen::Editor => self.editor_key(code),
             },
         }
         false
@@ -100,6 +129,11 @@ impl App {
             KeyCode::PageDown => *c = (*c + 10).min(last),
             KeyCode::Home => *c = 0,
             KeyCode::End => *c = last,
+            KeyCode::Enter => {
+                if let Some(a) = self.albums.get(self.album_cursor).cloned() {
+                    self.open_tracks(&a.tracks, album_title(&a), None);
+                }
+            }
             _ => {}
         }
     }
@@ -116,21 +150,94 @@ impl App {
         }
     }
 
+    fn open_tracks(&mut self, paths: &[PathBuf], title: String, select: Option<&Path>) {
+        let mut tracks = Vec::new();
+        let mut failed = 0;
+        for path in paths {
+            match Track::load(path) {
+                Ok(t) => tracks.push(t),
+                Err(_) => failed += 1,
+            }
+        }
+        if tracks.is_empty() {
+            self.status = "no readable audio files here".into();
+            return;
+        }
+        self.track = select
+            .and_then(|s| tracks.iter().position(|t| t.path == s))
+            .map_or(0, |i| i + 1);
+        self.field = self.field.min(FIRST_MORE - 1);
+        self.focus_tracks = false;
+        self.status = match failed {
+            0 => format!("{} tracks", tracks.len()),
+            n => format!("{} tracks ({n} could not be read)", tracks.len()),
+        };
+        self.open = Some(Open {
+            title,
+            tracks,
+            from: self.screen,
+        });
+        self.screen = Screen::Editor;
+    }
+
+    fn selection(&self) -> &[Track] {
+        match &self.open {
+            Some(o) if self.track == 0 => &o.tracks,
+            Some(o) => std::slice::from_ref(&o.tracks[self.track - 1]),
+            None => &[],
+        }
+    }
+
+    fn editor_key(&mut self, code: KeyCode) {
+        let Some(tracks) = self.open.as_ref().map(|o| 1 + o.tracks.len()) else {
+            return;
+        };
+        let fields = field_rows(self.selection()).len();
+        match code {
+            KeyCode::Esc => self.screen = self.open.as_ref().map_or(Screen::Albums, |o| o.from),
+            KeyCode::Left | KeyCode::Char('h') => self.focus_tracks = true,
+            KeyCode::Right | KeyCode::Char('l') => self.focus_tracks = false,
+            KeyCode::Enter if self.focus_tracks => self.focus_tracks = false,
+            KeyCode::Up | KeyCode::Char('k') if self.focus_tracks => {
+                self.track = (self.track + tracks - 1) % tracks;
+                self.track_changed();
+            }
+            KeyCode::Down | KeyCode::Char('j') if self.focus_tracks => {
+                self.track = (self.track + 1) % tracks;
+                self.track_changed();
+            }
+            KeyCode::Up | KeyCode::Char('k') => self.field = (self.field + fields - 1) % fields,
+            KeyCode::Down | KeyCode::Char('j') => self.field = (self.field + 1) % fields,
+            _ => {}
+        }
+    }
+
+    fn track_changed(&mut self) {
+        self.field = self.field.min(field_rows(self.selection()).len() - 1);
+    }
+
     fn draw(&self, f: &mut ratatui::Frame) {
         let [main, status] =
             Layout::vertical([Constraint::Min(5), Constraint::Length(1)]).areas(f.area());
-        match self.screen {
-            Screen::Folders => self.draw_tree(f, main),
-            Screen::Albums => self.draw_albums(f, main),
+        match (self.screen, &self.open) {
+            (Screen::Editor, Some(o)) => self.draw_editor(f, o, main),
+            (Screen::Folders, _) => self.draw_tree(f, main),
+            _ => self.draw_albums(f, main),
         }
         f.render_widget(Paragraph::new(self.status.as_str()), status);
     }
 
     fn draw_albums(&self, f: &mut ratatui::Frame, area: Rect) {
+        let open: Option<&Path> = self.open.as_ref().map(|o| o.tracks[0].path.as_path());
         let items: Vec<ListItem> = self
             .albums
             .iter()
             .map(|a| {
+                let mark = if open.is_some_and(|p| a.tracks.iter().any(|t| t == p)) {
+                    " ●"
+                } else {
+                    ""
+                };
                 ListItem::new(Line::from(vec![
                     Span::styled(
                         or_none(&a.album, "(no album)"),
@@ -144,6 +251,7 @@ impl App {
                         format!("  {}", a.tracks.len()),
                         Style::default().fg(Color::DarkGray),
                     ),
+                    Span::styled(mark, Style::default().fg(Color::Green)),
                 ]))
             })
             .collect();
@@ -187,6 +295,202 @@ impl App {
         let mut state = ListState::default().with_selected(Some(self.tree.cursor));
         f.render_stateful_widget(list, area, &mut state);
     }
+
+    fn draw_editor(&self, f: &mut ratatui::Frame, o: &Open, area: Rect) {
+        let left = (area.width / 3).clamp(24, 44);
+        let [list_area, right] =
+            Layout::horizontal([Constraint::Length(left), Constraint::Min(30)]).areas(area);
+
+        // Track list: "all" first, then each track; * marks unsaved edits.
+        let dirty = Span::styled(" *", Style::default().fg(Color::Green));
+        let all_dirty = o.tracks.iter().any(Track::dirty);
+        let mut items = vec![ListItem::new(Line::from(vec![
+            Span::raw(format!("◆ all ({})", o.tracks.len())),
+            if all_dirty {
+                dirty.clone()
+            } else {
+                Span::raw("")
+            },
+        ]))];
+        items.extend(o.tracks.iter().map(|t| {
+            let mut spans = vec![Span::raw(track_label(t))];
+            if t.dirty() {
+                spans.push(dirty.clone());
+            }
+            ListItem::new(Line::from(spans))
+        }));
+        let highlight = if self.focus_tracks {
+            Style::default().add_modifier(Modifier::REVERSED)
+        } else {
+            Style::default().fg(Color::Yellow)
+        };
+        let list = List::new(items)
+            .block(Block::default().borders(Borders::ALL).title(" tracks "))
+            .highlight_style(highlight);
+        let mut state = ListState::default().with_selected(Some(self.track));
+        f.render_stateful_widget(list, list_area, &mut state);
+
+        let title = format!(
+            " {}{} ",
+            or_none(&o.title, "(no album)"),
+            if all_dirty { " * (unsaved)" } else { "" }
+        );
+        let block = Block::default().borders(Borders::ALL).title(title);
+        let inner = block.inner(right);
+        f.render_widget(block, right);
+        let [info_area, fields_area] =
+            Layout::vertical([Constraint::Length(4), Constraint::Min(1)]).areas(inner);
+
+        let sel = self.selection();
+        let info: Vec<Line> = audio_info(sel).into_iter().map(Line::from).collect();
+        f.render_widget(Paragraph::new(info), info_area);
+
+        let rows = field_rows(sel);
+        let focus = !self.focus_tracks;
+        let mut table_rows = Vec::new();
+        for (i, key) in rows.iter().enumerate() {
+            if i == FIRST_MORE {
+                table_rows.push(TableRow::new(vec![Cell::from(Span::styled(
+                    "── more ──",
+                    Style::default().fg(Color::DarkGray),
+                ))]));
+            }
+            let here = focus && i == self.field;
+            let label = key.map_or("Filename".into(), tags::label);
+            let label_style = if here {
+                Style::default().add_modifier(Modifier::REVERSED)
+            } else {
+                Style::default()
+            };
+            let value = self.value_line(sel, *key, here);
+            table_rows.push(TableRow::new(vec![
+                Cell::from(Span::styled(label, label_style)),
+                Cell::from(value),
+            ]));
+        }
+        let shown = self.field + usize::from(self.field >= FIRST_MORE);
+        let table = Table::new(table_rows, [Constraint::Length(16), Constraint::Min(10)]);
+        let mut state = TableState::default().with_selected(focus.then_some(shown));
+        f.render_stateful_widget(table, fields_area, &mut state);
+    }
+
+    /// A field's value for the selection: shared value, or <various>; green when edited.
+    fn value_line(&self, sel: &[Track], key: Option<ItemKey>, here: bool) -> Line<'static> {
+        let (text, edited) = match key {
+            None => match sel {
+                [t] => (
+                    t.path
+                        .file_name()
+                        .unwrap_or_default()
+                        .to_string_lossy()
+                        .into(),
+                    false,
+                ),
+                _ => (VARIOUS.to_string(), false),
+            },
+            Some(k) => {
+                let edited = sel
+                    .iter()
+                    .any(|t| tags::get(&t.draft, k) != tags::get(&t.saved, k));
+                let text = match tags::common(sel, k) {
+                    Some(v) if v.contains('\n') => {
+                        format!("{}…", v.lines().next().unwrap_or(""))
+                    }
+                    Some(v) => v.to_string(),
+                    None => VARIOUS.to_string(),
+                };
+                (text, edited)
+            }
+        };
+        let mut style = Style::default();
+        if text == VARIOUS {
+            style = style.fg(Color::DarkGray);
+        }
+        if edited {
+            style = style.fg(Color::Green);
+        }
+        if here {
+            style = style.fg(Color::Black).bg(Color::Yellow);
+        }
+        Line::from(Span::styled(text, style))
+    }
+}
+
+/// The field list for a selection: Filename (`None`), `MAIN`, `MORE`, then every other
+/// standard field the selected tracks have, by label.
+fn field_rows(sel: &[Track]) -> Vec<Option<ItemKey>> {
+    let listed = |k: &ItemKey| MAIN.iter().chain(&MORE).any(|(m, _)| m == k);
+    let mut extra: Vec<ItemKey> = sel
+        .iter()
+        .flat_map(|t| t.draft.keys().chain(t.saved.keys()))
+        .copied()
+        .filter(|k| !listed(k))
+        .collect();
+    extra.sort_by_key(|k| tags::label(*k));
+    extra.dedup();
+    std::iter::once(None)
+        .chain(MAIN.iter().chain(&MORE).map(|(k, _)| Some(*k)))
+        .chain(extra.into_iter().map(Some))
+        .collect()
+}
+
+/// Format, quality and bitrate lines; ranges when the tracks differ.
+fn audio_info(sel: &[Track]) -> Vec<String> {
+    fn joined(mut values: Vec<String>) -> String {
+        values.dedup();
+        values.join(", ")
+    }
+    let mut exts: Vec<String> = sel.iter().map(|t| t.info.ext.clone()).collect();
+    exts.sort();
+    let mut quality: Vec<String> = sel
+        .iter()
+        .map(|t| {
+            let bits = t
+                .info
+                .bits
+                .map(|b| format!("{b} bit · "))
+                .unwrap_or_default();
+            let khz = t.info.hz.map_or("? kHz".into(), |hz| {
+                format!("{} kHz", (hz as f64 / 100.0).round() / 10.0)
+            });
+            format!("{bits}{khz}")
+        })
+        .collect();
+    quality.sort();
+    let kbps: Vec<u32> = sel.iter().filter_map(|t| t.info.kbps).collect();
+    let rate = match (kbps.iter().min(), kbps.iter().max()) {
+        (Some(lo), Some(hi)) if lo == hi => format!("{lo} kbps"),
+        (Some(lo), Some(hi)) => format!("{lo}–{hi} kbps"),
+        _ => "? kbps".into(),
+    };
+    vec![joined(exts), joined(quality), rate]
+}
+
+/// "03 Title" (title falls back to the file name).
+fn track_label(t: &Track) -> String {
+    let number = tags::get(&t.draft, ItemKey::TrackNumber);
+    let number = match number.parse::<u32>() {
+        Ok(n) => format!("{n:02} "),
+        Err(_) => String::new(),
+    };
+    let title = match tags::get(&t.draft, ItemKey::TrackTitle) {
+        "" => t
+            .path
+            .file_stem()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .into(),
+        title => title.to_string(),
+    };
+    format!("{number}{title}")
+}
+
+fn album_title(a: &Album) -> String {
+    format!(
+        "{} — {}",
+        or_none(&a.album, "(no album)"),
+        or_none(&a.artist, "(no artist)")
+    )
 }
 
 fn or_none<'a>(s: &'a str, none: &'a str) -> &'a str {
@@ -342,5 +646,39 @@ mod terminal_tests {
         }));
         assert!(result.is_err());
         assert_eq!(calls.borrow().last(), Some(&"disable_raw"));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const FIXTURES: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures");
+
+    /// A library with one album (the three fixtures share their tags).
+    fn library(test: &str) -> PathBuf {
+        let root = std::env::temp_dir().join(format!("tagui-tui-{}-{test}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("Album")).unwrap();
+        for f in ["tiny.flac", "tiny.mp3", "tiny.m4a"] {
+            std::fs::copy(Path::new(FIXTURES).join(f), root.join("Album").join(f)).unwrap();
+        }
+        root
+    }
+
+    #[test]
+    fn audio_info_shows_ranges() {
+        let root = library("info");
+        let mut tracks: Vec<Track> = ["tiny.flac", "tiny.mp3"]
+            .iter()
+            .map(|f| Track::load(&root.join("Album").join(f)).unwrap())
+            .collect();
+        tracks[0].info.kbps = Some(900);
+        tracks[1].info.kbps = Some(320);
+        let info = audio_info(&tracks);
+        assert_eq!(info[0], "flac, mp3");
+        assert_eq!(info[2], "320–900 kbps");
+        assert_eq!(audio_info(&tracks[..1])[1], "16 bit · 44.1 kHz");
+        std::fs::remove_dir_all(&root).unwrap();
     }
 }
