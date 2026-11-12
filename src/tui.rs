@@ -23,6 +23,7 @@ use ratatui::widgets::{
 };
 use ratatui_image::picker::Picker;
 use ratatui_image::protocol::Protocol;
+use ratatui_image::sliced::{SignedPosition, SlicedImage, SlicedProtocol};
 use ratatui_image::{Image, Resize};
 use std::collections::{BTreeSet, HashMap};
 use std::io::{stdout, Stdout};
@@ -170,7 +171,12 @@ type ThumbKey = (PathBuf, Size);
 /// Workers that decode album covers off the UI thread (decoding a 1400 px JPEG takes
 /// ~12 ms): keys in, protocols out. They stop when the job sender is dropped.
 // ponytail: FIFO, so a fast scroll decodes every album it passes; drop stale jobs if it lags.
-fn thumb_workers(picker: &Picker) -> (Sender<ThumbKey>, Receiver<(ThumbKey, Option<Protocol>)>) {
+fn thumb_workers(
+    picker: &Picker,
+) -> (
+    Sender<ThumbKey>,
+    Receiver<(ThumbKey, Option<SlicedProtocol>)>,
+) {
     let (jobs, queue) = mpsc::channel::<ThumbKey>();
     let (done, results) = mpsc::channel();
     let queue = Arc::new(Mutex::new(queue));
@@ -188,7 +194,7 @@ fn thumb_workers(picker: &Picker) -> (Sender<ThumbKey>, Receiver<(ThumbKey, Opti
             let thumb = tags::cover(&key.0).and_then(|bytes| {
                 let img = image::load_from_memory(&bytes).ok()?;
                 let fit = Resize::Fit(Some(FilterType::Triangle));
-                picker.new_protocol(img, key.1, fit).ok()
+                SlicedProtocol::new_with_resize(&picker, img, key.1, fit).ok()
             });
             if done.send((key, thumb)).is_err() {
                 return;
@@ -206,16 +212,16 @@ struct App {
     /// Albums ordered by artist, else by album.
     albums_by_artist: bool,
     album_view: AlbumView,
-    /// First line of albums on show in the views that scroll themselves (rows, grid).
-    album_top: usize,
+    /// Terminal lines scrolled past in the views that scroll themselves (rows, grid).
+    album_scroll: usize,
     /// Albums per line and per screen at the last draw, for the keys that move by them.
     tile_cols: usize,
     tile_page: usize,
     /// Album covers by first track and size; None while loading or when there is none.
-    thumbs: HashMap<ThumbKey, Option<Protocol>>,
+    thumbs: HashMap<ThumbKey, Option<SlicedProtocol>>,
     /// Covers asked from the workers (`thumb_workers`) and not back yet.
     thumb_jobs: Sender<ThumbKey>,
-    thumb_done: Receiver<(ThumbKey, Option<Protocol>)>,
+    thumb_done: Receiver<(ThumbKey, Option<SlicedProtocol>)>,
     loading: usize,
     tree: Tree,
     open: Option<Open>,
@@ -253,7 +259,7 @@ impl App {
             album_cursor: 0,
             albums_by_artist: false,
             album_view: AlbumView::Compact,
-            album_top: 0,
+            album_scroll: 0,
             tile_cols: 1,
             tile_page: 10,
             thumbs: HashMap::new(),
@@ -1147,31 +1153,37 @@ impl App {
         let columns = Layout::horizontal(vec![Constraint::Length(width); cols])
             .flex(Flex::SpaceEvenly)
             .split(inner);
-        let lines = (inner.height / cell.height).max(1) as usize;
-        (self.tile_cols, self.tile_page) = (cols, cols * lines);
-        let line = self.album_cursor / cols;
-        self.album_top = self
-            .album_top
-            .min(line)
-            .max((line + 1).saturating_sub(lines));
+        // The view scrolls by terminal line: rows cut at the top or bottom show in part.
+        let (cell_h, height) = (cell.height as usize, inner.height as usize);
+        let rows_on_screen = (height / cell_h).max(1);
+        (self.tile_cols, self.tile_page) = (cols, cols * rows_on_screen);
+        let cursor_y = self.album_cursor / cols * cell_h;
+        let content = self.albums.len().div_ceil(cols) * cell_h;
+        self.album_scroll = self
+            .album_scroll
+            .min(content.saturating_sub(height))
+            .max((cursor_y + cell_h).saturating_sub(height))
+            .min(cursor_y);
 
         let open: Option<PathBuf> = self.open.as_ref().map(|o| o.tracks[0].path.clone());
-        let first = self.album_top * cols;
-        for i in (first..self.albums.len()).take(lines * cols) {
-            let n = i - first;
-            let tile = Rect::new(
-                columns[n % cols].x,
-                inner.y + (n / cols) as u16 * cell.height,
-                width,
-                cell.height,
-            )
-            .intersection(inner);
-            let [pic, text] = if grid {
-                Layout::vertical([Constraint::Length(thumb.height), Constraint::Length(2)])
-                    .areas(tile)
-            } else {
-                Layout::horizontal([Constraint::Length(thumb.width + 1), Constraint::Min(1)])
-                    .areas(tile)
+        let first_row = self.album_scroll / cell_h;
+        let last_row = (self.album_scroll + height).div_ceil(cell_h);
+        let (text_dy, text_dx, text_h) = if grid {
+            (thumb.height, 0, 2)
+        } else {
+            (0, thumb.width + 1, THUMB.height)
+        };
+        for i in (first_row * cols..self.albums.len()).take((last_row - first_row) * cols) {
+            let column = columns[i % cols];
+            // Top of the tile in the view; negative when it is cut at the top.
+            let top = (i / cols * cell_h) as i32 - self.album_scroll as i32;
+            // One view line `dy` lines down the tile, from `dx` to the column's end.
+            let line_at = |dy: u16, dx: u16| {
+                let y = top + i32::from(dy);
+                let line = Rect::new(column.x + dx, inner.y + y.max(0) as u16, column.width, 1);
+                (0..inner.height as i32)
+                    .contains(&y)
+                    .then(|| line.intersection(column).intersection(inner))
             };
             let a = &self.albums[i];
             let mark = if open.as_ref().is_some_and(|p| a.tracks.contains(p)) {
@@ -1179,7 +1191,7 @@ impl App {
             } else {
                 ""
             };
-            let lines = vec![
+            let mut lines = vec![
                 Line::from(vec![
                     Span::styled(
                         or_none(&a.album, "(no album)").to_string(),
@@ -1196,29 +1208,45 @@ impl App {
                     Style::default().fg(Color::Cyan),
                 )),
             ];
+            lines.resize(text_h.into(), Line::default());
             let style = if i == self.album_cursor {
                 Style::default().add_modifier(Modifier::REVERSED)
             } else {
                 Style::default()
             };
-            f.render_widget(Paragraph::new(lines).style(style), text);
-            let pic = Rect::new(pic.x, pic.y, thumb.width, thumb.height).intersection(pic);
+            for (dy, line) in (text_dy..).zip(lines) {
+                if let Some(area) = line_at(dy, text_dx) {
+                    f.render_widget(Paragraph::new(line).style(style), area);
+                }
+            }
+            let strip = Rect::new(column.x, inner.y, thumb.width, inner.height).intersection(inner);
             match self.thumb(i, thumb) {
-                Some(p) => f.render_widget(Image::new(p), pic),
+                Some(p) => {
+                    let at = SignedPosition {
+                        x: 0,
+                        y: top as i16,
+                    };
+                    f.render_widget(SlicedImage::new(p, at), strip);
+                }
                 None => {
-                    let mut lines = vec![Line::default(); (pic.height / 2) as usize];
-                    lines.push(Line::from("♪"));
-                    let placeholder = Paragraph::new(lines)
-                        .centered()
-                        .style(Style::default().fg(Color::DarkGray));
-                    f.render_widget(placeholder, pic);
+                    if let Some(area) = line_at(thumb.height / 2, 0) {
+                        let area = Rect {
+                            width: thumb.width,
+                            ..area
+                        }
+                        .intersection(area);
+                        let placeholder = Paragraph::new("♪")
+                            .centered()
+                            .style(Style::default().fg(Color::DarkGray));
+                        f.render_widget(placeholder, area);
+                    }
                 }
             }
         }
     }
 
     /// Album `i`'s cover fit to `size`; asks the workers for it on first use.
-    fn thumb(&mut self, i: usize, size: Size) -> Option<&Protocol> {
+    fn thumb(&mut self, i: usize, size: Size) -> Option<&SlicedProtocol> {
         let key = (self.albums.get(i)?.tracks.first()?.clone(), size);
         if !self.thumbs.contains_key(&key) {
             self.thumbs.insert(key.clone(), None);
@@ -1966,6 +1994,32 @@ mod tests {
         assert_eq!(app.album_cursor, 6);
         press(&mut app, "hk");
         assert_eq!(app.album_cursor, 0);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn grid_scrolls_by_line_showing_cut_rows() {
+        let root = library("album-scroll");
+        let mut app = App::new(root.clone(), Picker::halfblocks());
+        let album = |album: String| Album {
+            artist: "Lamp".into(),
+            album,
+            year: String::new(),
+            tracks: vec![],
+        };
+        app.albums = (0..20).map(|i| album(format!("Album {i:02}"))).collect();
+        press(&mut app, "vv");
+        screen_text(&mut app);
+        // 5 columns of 12-line tiles in a 27-line view: the third row needs 9 lines more.
+        press(&mut app, "jj");
+        let screen = screen_text(&mut app);
+        assert_eq!(app.album_scroll, 9);
+        assert!(screen.contains("Album 00"), "{screen}"); // first row cut at the top
+        assert!(screen.contains("Album 10"));
+        assert!(!screen.contains("Album 15"));
+        press(&mut app, "kk");
+        screen_text(&mut app);
+        assert_eq!(app.album_scroll, 0);
         std::fs::remove_dir_all(&root).unwrap();
     }
 
