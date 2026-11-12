@@ -146,6 +146,26 @@ impl App {
             KeyCode::PageDown => self.tree.move_by(10),
             KeyCode::Left | KeyCode::Char('h') => self.tree.set_expanded(false),
             KeyCode::Right | KeyCode::Char('l') => self.tree.set_expanded(true),
+            KeyCode::Enter => {
+                let Some(node) = self.tree.selected().cloned() else {
+                    return;
+                };
+                // A folder opens its own tracks; a file opens its folder at that track.
+                let (dir, select) = if node.is_dir {
+                    (node.path.clone(), None)
+                } else {
+                    let parent = node.path.parent().unwrap_or(Path::new("")).to_owned();
+                    (parent, Some(node.path.as_path()))
+                };
+                let tracks = library::audio_in(&dir);
+                if tracks.is_empty() {
+                    let open = self.tree.expanded.contains(&node.path);
+                    self.tree.set_expanded(!open);
+                    return;
+                }
+                let title = dir.file_name().unwrap_or_default().to_string_lossy();
+                self.open_tracks(&tracks, title.into(), select);
+            }
             _ => {}
         }
     }
@@ -664,6 +684,35 @@ mod tests {
             std::fs::copy(Path::new(FIXTURES).join(f), root.join("Album").join(f)).unwrap();
         }
         root
+    }
+
+    fn press(app: &mut App, keys: &str) -> bool {
+        let mut quit = false;
+        for c in keys.chars() {
+            let code = match c {
+                '\n' => KeyCode::Enter,
+                '\x08' => KeyCode::Backspace,
+                '\x1b' => KeyCode::Esc,
+                c => KeyCode::Char(c),
+            };
+            quit = app.key(KeyEvent::from(code));
+        }
+        quit
+    }
+
+    #[test]
+    fn folders_open_the_folder_at_a_track() {
+        let root = library("folders");
+        let mut app = App::new(root.clone());
+        app.key(KeyEvent::from(KeyCode::Tab));
+        assert_eq!(app.screen, Screen::Folders);
+        press(&mut app, "ljj\n"); // expand Album, go to its second file
+        assert_eq!(app.screen, Screen::Editor);
+        assert_eq!(app.open.as_ref().unwrap().tracks.len(), 3);
+        assert_eq!(app.selection()[0].path, root.join("Album/tiny.m4a"));
+        press(&mut app, "\x1b");
+        assert_eq!(app.screen, Screen::Folders);
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]
