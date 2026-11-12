@@ -36,7 +36,7 @@ const COVER: Size = Size::new(20, 10);
 /// Thumbnail of each album in the rows view, in cells.
 const THUMB: Size = Size::new(6, 3);
 /// Cover of each album in the grid view, in cells; two lines of text go under it.
-const GRID: Size = Size::new(16, 8);
+const GRID: Size = Size::new(20, 10);
 /// Fields that differ per track by nature: not edited for a whole album at once.
 /// Fields the "all" row hides: they only make sense track by track.
 const PER_TRACK: [ItemKey; 2] = [ItemKey::TrackNumber, ItemKey::TrackTitle];
@@ -1185,7 +1185,11 @@ impl App {
                     Span::styled(mark, Style::default().fg(Color::Green)),
                 ]),
                 Line::from(Span::styled(
-                    album_meta(a, !grid),
+                    if grid {
+                        or_none(&a.artist, "(no artist)").to_string()
+                    } else {
+                        album_meta(a)
+                    },
                     Style::default().fg(Color::Cyan),
                 )),
             ];
@@ -1558,13 +1562,11 @@ fn album_title(a: &Album) -> String {
     )
 }
 
-/// "Artist · 2004 · 12 tracks" (the year only when asked), without the parts that are
-/// missing.
-fn album_meta(a: &Album, year: bool) -> String {
+/// "Artist · 2004 · 12 tracks", without the parts that are missing.
+fn album_meta(a: &Album) -> String {
     let n = a.tracks.len();
     let tracks = format!("{n} track{}", if n == 1 { "" } else { "s" });
-    let year = if year { a.year.as_str() } else { "" };
-    [or_none(&a.artist, "(no artist)"), year, &tracks]
+    [or_none(&a.artist, "(no artist)"), &a.year, &tracks]
         .iter()
         .filter(|s| !s.is_empty())
         .copied()
@@ -1844,7 +1846,7 @@ mod tests {
         assert_eq!(app.selection().len(), 1);
         assert!(screen_text(&mut app).contains("Filename"));
         press(&mut app, "kkkd"); // track 1 artist cleared
-        press(&mut app, "hk"); // back to "all", still on Artist
+        press(&mut app, "hhk"); // back to "all", still on Artist
         assert_eq!(app.track, 0);
         assert_eq!(app.selected_key(), Some(ItemKey::TrackArtist));
         assert!(screen_text(&mut app).contains(VARIOUS));
@@ -1947,12 +1949,12 @@ mod tests {
         app.albums = (0..7).map(|i| album(format!("A{i}"))).collect();
         press(&mut app, "vv");
         assert!(screen_text(&mut app).contains("· grid "));
-        assert_eq!(app.tile_cols, 5); // 98 cells inside the border, 18 per tile
+        assert_eq!(app.tile_cols, 4); // 98 cells inside the border, 22 per tile
         press(&mut app, "j");
-        assert_eq!(app.album_cursor, 5);
-        press(&mut app, "lj");
+        assert_eq!(app.album_cursor, 4);
+        press(&mut app, "llj");
         assert_eq!(app.album_cursor, 6);
-        press(&mut app, "hk");
+        press(&mut app, "hhk");
         assert_eq!(app.album_cursor, 0);
         std::fs::remove_dir_all(&root).unwrap();
     }
