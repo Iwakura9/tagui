@@ -25,7 +25,14 @@ pub fn run(root: PathBuf) -> Result<()> {
     App::new(root).event_loop(&mut terminal)
 }
 
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Screen {
+    Albums,
+    Folders,
+}
+
 struct App {
+    screen: Screen,
     albums: Vec<Album>,
     album_cursor: usize,
     tree: Tree,
@@ -38,6 +45,7 @@ impl App {
         let albums = library::albums(&rows);
         let status = format!("{} tracks in {} albums", rows.len(), albums.len());
         Self {
+            screen: Screen::Albums,
             albums,
             album_cursor: 0,
             tree: Tree::new(root),
@@ -67,7 +75,18 @@ impl App {
         if ctrl_c || key.code == KeyCode::Char('q') {
             return true;
         }
-        self.albums_key(key.code);
+        match key.code {
+            KeyCode::Tab => {
+                self.screen = match self.screen {
+                    Screen::Albums => Screen::Folders,
+                    _ => Screen::Albums,
+                }
+            }
+            code => match self.screen {
+                Screen::Albums => self.albums_key(code),
+                Screen::Folders => self.folders_key(code),
+            },
+        }
         false
     }
 
@@ -85,10 +104,25 @@ impl App {
         }
     }
 
+    fn folders_key(&mut self, code: KeyCode) {
+        match code {
+            KeyCode::Up | KeyCode::Char('k') => self.tree.move_by(-1),
+            KeyCode::Down | KeyCode::Char('j') => self.tree.move_by(1),
+            KeyCode::PageUp => self.tree.move_by(-10),
+            KeyCode::PageDown => self.tree.move_by(10),
+            KeyCode::Left | KeyCode::Char('h') => self.tree.set_expanded(false),
+            KeyCode::Right | KeyCode::Char('l') => self.tree.set_expanded(true),
+            _ => {}
+        }
+    }
+
     fn draw(&self, f: &mut ratatui::Frame) {
         let [main, status] =
             Layout::vertical([Constraint::Min(5), Constraint::Length(1)]).areas(f.area());
-        self.draw_albums(f, main);
+        match self.screen {
+            Screen::Folders => self.draw_tree(f, main),
+            Screen::Albums => self.draw_albums(f, main),
+        }
         f.render_widget(Paragraph::new(self.status.as_str()), status);
     }
 
@@ -118,6 +152,39 @@ impl App {
             .block(Block::default().borders(Borders::ALL).title(title))
             .highlight_style(Style::default().add_modifier(Modifier::REVERSED));
         let mut state = ListState::default().with_selected(Some(self.album_cursor));
+        f.render_stateful_widget(list, area, &mut state);
+    }
+
+    fn draw_tree(&self, f: &mut ratatui::Frame, area: Rect) {
+        let items: Vec<ListItem> = self
+            .tree
+            .visible
+            .iter()
+            .map(|n| {
+                let name = n.path.file_name().unwrap_or_default().to_string_lossy();
+                let (icon, style) = match (n.is_dir, self.tree.expanded.contains(&n.path)) {
+                    (true, open) => (
+                        if open { "▾ " } else { "▸ " },
+                        Style::default()
+                            .fg(Color::Cyan)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    _ => ("  ", Style::default()),
+                };
+                ListItem::new(Line::from(vec![
+                    Span::raw("  ".repeat(n.depth)),
+                    Span::styled(format!("{icon}{name}"), style),
+                ]))
+            })
+            .collect();
+        let list = List::new(items)
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(format!(" {} ", self.tree.root.display())),
+            )
+            .highlight_style(Style::default().add_modifier(Modifier::REVERSED));
+        let mut state = ListState::default().with_selected(Some(self.tree.cursor));
         f.render_stateful_widget(list, area, &mut state);
     }
 }
