@@ -23,6 +23,7 @@ use ratatui::widgets::{
 use ratatui_image::picker::Picker;
 use ratatui_image::protocol::Protocol;
 use ratatui_image::{Image, Resize};
+use std::collections::BTreeSet;
 use std::io::{stdout, Stdout};
 use std::path::{Path, PathBuf};
 
@@ -102,10 +103,17 @@ impl Input {
     }
 }
 
-/// A `/` search being typed in a list; Esc puts the cursor back at `origin`.
+/// A `/` search: results filter as the query changes, Enter opens the picked one.
 struct Search {
     query: String,
-    origin: usize,
+    pick: usize,
+}
+
+/// One `/` result: an album (index into `albums`), a folder, or a song (index into `rows`).
+enum Hit {
+    Album(usize),
+    Folder(PathBuf),
+    Song(usize),
 }
 
 /// The decoded cover on show.
@@ -131,8 +139,6 @@ struct App {
     focus_tracks: bool,
     editing: Option<Input>,
     search: Option<Search>,
-    /// The last confirmed search, repeated by n / N.
-    last_search: String,
     show_help: bool,
     /// An action that would drop unsaved edits asked once and waits for its repeat.
     confirm: bool,
@@ -165,7 +171,6 @@ impl App {
             focus_tracks: false,
             editing: None,
             search: None,
-            last_search: String::new(),
             show_help: false,
             confirm: false,
             armed: false,
@@ -249,8 +254,6 @@ impl App {
             KeyCode::Home => *c = 0,
             KeyCode::End => *c = last,
             KeyCode::Char('/') => self.start_search(),
-            KeyCode::Char('n') => self.next_match(true),
-            KeyCode::Char('N') => self.next_match(false),
             KeyCode::Char('s') => {
                 let keep = self.albums.get(self.album_cursor).cloned();
                 self.albums_by_artist = !self.albums_by_artist;
@@ -285,94 +288,127 @@ impl App {
         }
     }
 
-    /// What `/` looks through on the current screen, one text per list entry.
-    fn search_entries(&self) -> Vec<String> {
-        match self.screen {
-            Screen::Folders => self
-                .tree
-                .visible
-                .iter()
-                .map(|n| {
-                    n.path
-                        .file_name()
-                        .unwrap_or_default()
-                        .to_string_lossy()
-                        .into()
-                })
-                .collect(),
-            _ => self
-                .albums
-                .iter()
-                .map(|a| format!("{} {}", a.album, a.artist))
-                .collect(),
-        }
-    }
-
-    fn cursor_mut(&mut self) -> &mut usize {
-        match self.screen {
-            Screen::Folders => &mut self.tree.cursor,
-            _ => &mut self.album_cursor,
-        }
-    }
-
     fn start_search(&mut self) {
-        let origin = *self.cursor_mut();
         self.search = Some(Search {
             query: String::new(),
-            origin,
+            pick: 0,
         });
-        self.status = "/".into();
+        self.status = "type to filter · ↑↓ pick · ⏎ open · esc close".into();
     }
 
-    /// Typing moves the cursor to the first entry (from where the search started) that
-    /// contains the text; Enter keeps it there, Esc goes back.
+    /// Albums (or folders, in Folders) whose name contains the query, ignoring case,
+    /// then songs whose title or artists do.
+    // ponytail: plain lowercase match, "uteis" won't find "Úteis"; fold accents if that bites.
+    fn search_results(&self, query: &str) -> Vec<Hit> {
+        let query = query.to_lowercase();
+        let hit = |text: &str| text.to_lowercase().contains(&query);
+        let groups: Vec<Hit> = match self.screen {
+            Screen::Folders => {
+                let dirs: BTreeSet<&Path> =
+                    self.rows.iter().filter_map(|r| r.path.parent()).collect();
+                dirs.into_iter()
+                    .filter(|d| hit(&d.file_name().unwrap_or_default().to_string_lossy()))
+                    .map(|d| Hit::Folder(d.to_owned()))
+                    .collect()
+            }
+            _ => (0..self.albums.len())
+                .filter(|&i| {
+                    hit(&format!(
+                        "{} {}",
+                        self.albums[i].album, self.albums[i].artist
+                    ))
+                })
+                .map(Hit::Album)
+                .collect(),
+        };
+        let songs = (0..self.rows.len())
+            .filter(|&i| {
+                hit(&format!(
+                    "{} {}",
+                    self.rows[i].title,
+                    self.rows[i].artists.join(" ")
+                ))
+            })
+            .map(Hit::Song);
+        groups.into_iter().chain(songs).collect()
+    }
+
     fn search_key(&mut self, code: KeyCode) {
         let Some(mut search) = self.search.take() else {
             return;
         };
         match code {
             KeyCode::Esc => {
-                *self.cursor_mut() = search.origin;
                 self.status.clear();
                 return;
             }
             KeyCode::Enter => {
-                self.status.clear();
-                self.last_search = search.query;
+                let hit = self
+                    .search_results(&search.query)
+                    .into_iter()
+                    .nth(search.pick);
+                if let Some(hit) = hit {
+                    self.open_hit(hit);
+                }
+                // Kept open when nothing opened (unsaved draft: Enter again drops it).
+                if self.screen != Screen::Editor {
+                    self.search = Some(search);
+                }
                 return;
+            }
+            KeyCode::Up => search.pick = search.pick.saturating_sub(1),
+            KeyCode::Down => {
+                let last = self.search_results(&search.query).len().saturating_sub(1);
+                search.pick = (search.pick + 1).min(last);
             }
             KeyCode::Backspace => {
                 search.query.pop();
+                search.pick = 0;
             }
-            KeyCode::Char(c) => search.query.push(c),
+            KeyCode::Char(c) => {
+                search.query.push(c);
+                search.pick = 0;
+            }
             _ => {}
         }
-        let found = find(&self.search_entries(), &search.query, search.origin, true);
-        *self.cursor_mut() = found.unwrap_or(search.origin);
-        let miss = if found.is_none() { "  (no match)" } else { "" };
-        self.status = format!("/{}{miss}", search.query);
         self.search = Some(search);
     }
 
-    /// n / N: move to the next / previous entry matching the last search.
-    fn next_match(&mut self, forward: bool) {
-        if self.last_search.is_empty() {
-            self.status = "no search yet: / to search".into();
+    /// Open a result in the editor; a song opens its album (or folder) at that track.
+    fn open_hit(&mut self, hit: Hit) {
+        let (album, song) = match hit {
+            Hit::Folder(dir) => {
+                self.open_dir(&dir, None);
+                return;
+            }
+            Hit::Album(i) => (Some(i), None),
+            Hit::Song(i) => {
+                let path = self.rows[i].path.clone();
+                if self.screen == Screen::Folders {
+                    let dir = path.parent().unwrap_or(Path::new("")).to_owned();
+                    self.open_dir(&dir, Some(&path));
+                    return;
+                }
+                let album = self.albums.iter().position(|a| a.tracks.contains(&path));
+                (album, Some(path))
+            }
+        };
+        let Some(a) = album.and_then(|i| self.albums.get(i)).cloned() else {
             return;
+        };
+        self.album_cursor = album.unwrap_or(0);
+        self.open_tracks(&a.tracks, album_title(&a), song.as_deref());
+    }
+
+    /// Open a folder's tracks at `select`; false when it holds no audio.
+    fn open_dir(&mut self, dir: &Path, select: Option<&Path>) -> bool {
+        let tracks = library::audio_in(dir);
+        if tracks.is_empty() {
+            return false;
         }
-        let entries = self.search_entries();
-        let n = entries.len();
-        if n == 0 {
-            return;
-        }
-        let cursor = *self.cursor_mut();
-        let from = (if forward { cursor + 1 } else { cursor + n - 1 }) % n;
-        let found = find(&entries, &self.last_search, from, forward);
-        let miss = if found.is_none() { "  (no match)" } else { "" };
-        self.status = format!("/{}{miss}", self.last_search);
-        if let Some(i) = found {
-            *self.cursor_mut() = i;
-        }
+        let title = dir.file_name().unwrap_or_default().to_string_lossy();
+        self.open_tracks(&tracks, title.into(), select);
+        true
     }
 
     fn folders_key(&mut self, code: KeyCode) {
@@ -388,8 +424,6 @@ impl App {
                 self.status = format!("folders by {}", self.folder_order());
             }
             KeyCode::Char('/') => self.start_search(),
-            KeyCode::Char('n') => self.next_match(true),
-            KeyCode::Char('N') => self.next_match(false),
             KeyCode::Enter => {
                 let Some(node) = self.tree.selected().cloned() else {
                     return;
@@ -401,14 +435,10 @@ impl App {
                     let parent = node.path.parent().unwrap_or(Path::new("")).to_owned();
                     (parent, Some(node.path.as_path()))
                 };
-                let tracks = library::audio_in(&dir);
-                if tracks.is_empty() {
+                if !self.open_dir(&dir, select) {
                     let open = self.tree.expanded.contains(&node.path);
                     self.tree.set_expanded(!open);
-                    return;
                 }
-                let title = dir.file_name().unwrap_or_default().to_string_lossy();
-                self.open_tracks(&tracks, title.into(), select);
             }
             _ => {}
         }
@@ -771,6 +801,9 @@ impl App {
             (Screen::Folders, _) => self.draw_tree(f, main),
             _ => self.draw_albums(f, main),
         }
+        if let Some(search) = &self.search {
+            self.draw_search(f, search, main);
+        }
         if !self.show_help || self.search.is_some() {
             f.render_widget(Paragraph::new(self.status.as_str()), status);
             return;
@@ -779,7 +812,6 @@ impl App {
             Screen::Albums => &[
                 ("⏎", "open"),
                 ("/", "search"),
-                ("n/N", "next"),
                 ("s", "sort"),
                 ("tab", "folders"),
                 ("q", "quit"),
@@ -787,7 +819,6 @@ impl App {
             Screen::Folders => &[
                 ("⏎", "open"),
                 ("/", "search"),
-                ("n/N", "next"),
                 ("s", "sort"),
                 ("←→", "fold"),
                 ("tab", "albums"),
@@ -820,6 +851,70 @@ impl App {
             ]);
             f.render_widget(hint, *cell);
         }
+    }
+
+    /// The `/` results over the list: albums and folders in bold, songs with their album.
+    fn draw_search(&self, f: &mut ratatui::Frame, search: &Search, area: Rect) {
+        let width = area.width.saturating_sub(4).min(90);
+        let height = area.height.saturating_sub(2).min(24);
+        let area = Rect::new(
+            area.x + (area.width - width) / 2,
+            area.y + (area.height - height) / 2,
+            width,
+            height,
+        );
+        let dim = Style::default().fg(Color::DarkGray);
+        let bold = Style::default().add_modifier(Modifier::BOLD);
+        let hits = self.search_results(&search.query);
+        let items: Vec<ListItem> = if hits.is_empty() {
+            vec![ListItem::new(Span::styled("no match", dim))]
+        } else {
+            hits.iter()
+                .map(|hit| match hit {
+                    Hit::Album(i) => ListItem::new(Span::styled(
+                        format!("▸ {}", album_title(&self.albums[*i])),
+                        bold,
+                    )),
+                    Hit::Folder(d) => {
+                        let name = d.file_name().unwrap_or_default().to_string_lossy();
+                        let parent = d
+                            .parent()
+                            .and_then(|p| p.strip_prefix(&self.tree.root).ok())
+                            .unwrap_or(Path::new(""));
+                        ListItem::new(Line::from(vec![
+                            Span::styled(format!("▸ {name}"), bold),
+                            Span::styled(format!("  {}", parent.display()), dim),
+                        ]))
+                    }
+                    Hit::Song(i) => {
+                        let r = &self.rows[*i];
+                        let title = match r.title.as_str() {
+                            "" => r.path.file_name().unwrap_or_default().to_string_lossy(),
+                            t => t.into(),
+                        };
+                        let from = format!(
+                            "  {} — {}",
+                            or_none(&r.album, "(no album)"),
+                            or_none(&r.artist, "(no artist)")
+                        );
+                        ListItem::new(Line::from(vec![
+                            Span::raw(format!("♪ {title}")),
+                            Span::styled(from, dim),
+                        ]))
+                    }
+                })
+                .collect()
+        };
+        let list = List::new(items)
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(format!(" /{}▏", search.query)),
+            )
+            .highlight_style(Style::default().fg(Color::Black).bg(Color::Yellow));
+        let pick = (!hits.is_empty()).then(|| search.pick.min(hits.len() - 1));
+        f.render_widget(Clear, area);
+        f.render_stateful_widget(list, area, &mut ListState::default().with_selected(pick));
     }
 
     fn draw_albums(&self, f: &mut ratatui::Frame, area: Rect) {
@@ -1089,17 +1184,6 @@ impl App {
         }
         Line::from(Span::styled(text, style))
     }
-}
-
-/// First entry from `from` on (wrapping, backwards unless `forward`) that contains
-/// `query`, ignoring case.
-// ponytail: plain lowercase match, "uteis" won't find "Úteis"; fold accents if that bites.
-fn find(entries: &[String], query: &str, from: usize, forward: bool) -> Option<usize> {
-    let query = query.to_lowercase();
-    let n = entries.len();
-    (0..n)
-        .map(|i| (if forward { from + i } else { from + n - i }) % n)
-        .find(|&i| entries[i].to_lowercase().contains(&query))
 }
 
 /// The field list for a selection: Filename (`None`), `MAIN`, `MORE`, then every other
@@ -1493,31 +1577,25 @@ mod tests {
     }
 
     #[test]
-    fn slash_searches_albums() {
+    fn slash_opens_albums_and_songs() {
         let root = library("search");
         let mut app = App::new(root.clone(), Picker::halfblocks());
-        let album = |album: &str, artist: &str| Album {
-            artist: artist.into(),
-            album: album.into(),
-            tracks: vec![],
-        };
-        app.albums = vec![
-            album("Dusk to Dawn", "Lamp"),
-            album("Timely!!", "Anri"),
-            album("Ampersands", "Mei Ehara"),
-        ];
-        assert!(!press(&mut app, "/ti"), "typing q-free text never quits");
-        assert_eq!(app.album_cursor, 1);
-        press(&mut app, "\x08\x08EHARA");
-        assert_eq!(app.album_cursor, 2, "artist matches, case ignored");
+        assert!(!press(&mut app, "/zzq"), "typing q-free text never quits");
+        assert!(screen_text(&app).contains("no match"));
         press(&mut app, "\x1b");
-        assert_eq!(app.album_cursor, 0, "Esc goes back");
-        press(&mut app, "/anri\n");
-        assert_eq!((app.album_cursor, app.search.is_none()), (1, true));
-        press(&mut app, "/zzq");
-        assert!(app.status.contains("no match"));
-        assert_eq!(app.album_cursor, 1);
-        press(&mut app, "\x1b");
+        assert_eq!((app.screen, app.search.is_none()), (Screen::Albums, true));
+        press(&mut app, "/ALBUM ARTIST");
+        let text = screen_text(&app);
+        assert!(text.contains("▸ Album — Album Artist"), "{text}");
+        assert!(text.contains("♪ Song"), "{text}");
+        press(&mut app, "\n");
+        assert_eq!((app.screen, app.track), (Screen::Editor, 0));
+        assert!(app.search.is_none());
+        press(&mut app, "\x1b/song");
+        app.key(KeyEvent::from(KeyCode::Down));
+        press(&mut app, "\n");
+        assert_eq!(app.screen, Screen::Editor);
+        assert_eq!(app.selection()[0].path, app.rows[1].path);
         std::fs::remove_dir_all(&root).unwrap();
     }
 
@@ -1542,36 +1620,6 @@ mod tests {
     }
 
     #[test]
-    fn n_and_shift_n_repeat_the_search() {
-        let entries = ["a lamp", "b", "c lamp", "d"].map(String::from);
-        assert_eq!(find(&entries, "LAMP", 1, true), Some(2));
-        assert_eq!(find(&entries, "lamp", 1, false), Some(0));
-        assert_eq!(find(&entries, "lamp", 3, true), Some(0), "wraps");
-        assert_eq!(find(&entries, "x", 0, true), None);
-
-        let root = library("next");
-        let mut app = App::new(root.clone(), Picker::halfblocks());
-        press(&mut app, "n");
-        assert!(app.status.contains("no search yet"));
-        app.albums = ["Lamp A", "Anri", "Lamp B"]
-            .map(|name| Album {
-                artist: String::new(),
-                album: name.into(),
-                tracks: vec![],
-            })
-            .to_vec();
-        press(&mut app, "/lamp\n");
-        assert_eq!(app.album_cursor, 0);
-        press(&mut app, "n");
-        assert_eq!(app.album_cursor, 2);
-        press(&mut app, "n");
-        assert_eq!(app.album_cursor, 0, "wraps");
-        press(&mut app, "N");
-        assert_eq!(app.album_cursor, 2);
-        std::fs::remove_dir_all(&root).unwrap();
-    }
-
-    #[test]
     fn folders_open_the_folder_at_a_track() {
         let root = library("folders");
         let mut app = App::new(root.clone(), Picker::halfblocks());
@@ -1586,11 +1634,15 @@ mod tests {
         assert_eq!(app.selection()[0].path, root.join("Album/tiny.m4a"));
         press(&mut app, "\x1b");
         assert_eq!(app.screen, Screen::Folders);
-        press(&mut app, "/MP3\n"); // visible entries only, case ignored
-        assert_eq!(
-            app.tree.selected().unwrap().path,
-            root.join("Album/tiny.mp3")
-        );
+        press(&mut app, "/song"); // songs open their folder at that track
+        app.key(KeyEvent::from(KeyCode::Down));
+        press(&mut app, "\n");
+        assert_eq!(app.screen, Screen::Editor);
+        assert_eq!(app.selection()[0].path, app.rows[1].path);
+        press(&mut app, "\x1b/album\n"); // folders match by name
+        assert_eq!(app.screen, Screen::Editor);
+        assert_eq!(app.open.as_ref().unwrap().title, "Album");
+        press(&mut app, "\x1b");
         app.key(KeyEvent::from(KeyCode::Tab));
         assert_eq!(app.screen, Screen::Albums);
         std::fs::remove_dir_all(&root).unwrap();
