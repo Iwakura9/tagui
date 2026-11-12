@@ -244,6 +244,14 @@ impl App {
         }
     }
 
+    fn folder_order(&self) -> &'static str {
+        if self.tree.by_date {
+            "date"
+        } else {
+            "name"
+        }
+    }
+
     /// What `/` looks through on the current screen, one text per list entry.
     fn search_entries(&self) -> Vec<String> {
         match self.screen {
@@ -342,6 +350,10 @@ impl App {
             KeyCode::PageDown => self.tree.move_by(10),
             KeyCode::Left | KeyCode::Char('h') => self.tree.set_expanded(false),
             KeyCode::Right | KeyCode::Char('l') => self.tree.set_expanded(true),
+            KeyCode::Char('s') => {
+                self.tree.toggle_order();
+                self.status = format!("folders by {}", self.folder_order());
+            }
             KeyCode::Char('/') => self.start_search(),
             KeyCode::Char('n') => self.next_match(true),
             KeyCode::Char('N') => self.next_match(false),
@@ -667,6 +679,7 @@ impl App {
                 ("⏎", "open"),
                 ("/", "search"),
                 ("n/N", "next"),
+                ("s", "sort"),
                 ("←→", "fold"),
                 ("tab", "editor"),
                 ("q", "quit"),
@@ -763,11 +776,11 @@ impl App {
             })
             .collect();
         let list = List::new(items)
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .title(format!(" {} ", self.tree.root.display())),
-            )
+            .block(Block::default().borders(Borders::ALL).title(format!(
+                " {} · by {} ",
+                self.tree.root.display(),
+                self.folder_order()
+            )))
             .highlight_style(Style::default().add_modifier(Modifier::REVERSED));
         let mut state = ListState::default().with_selected(Some(self.tree.cursor));
         f.render_stateful_widget(list, area, &mut state);
