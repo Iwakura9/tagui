@@ -13,7 +13,7 @@ use crossterm::terminal::{
 use image::imageops::FilterType;
 use lofty::tag::ItemKey;
 use ratatui::backend::CrosstermBackend;
-use ratatui::layout::{Constraint, Layout, Rect, Size};
+use ratatui::layout::{Constraint, Flex, Layout, Rect, Size};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
@@ -84,6 +84,7 @@ struct App {
     field: usize,
     focus_tracks: bool,
     editing: Option<Input>,
+    show_help: bool,
     /// An action that would drop unsaved edits asked once and waits for its repeat.
     confirm: bool,
     armed: bool,
@@ -96,7 +97,11 @@ impl App {
     fn new(root: PathBuf, picker: Picker) -> Self {
         let rows = library::scan(&root);
         let albums = library::albums(&rows);
-        let status = format!("{} tracks in {} albums", rows.len(), albums.len());
+        let status = format!(
+            "{} tracks in {} albums · ? for help",
+            rows.len(),
+            albums.len()
+        );
         Self {
             screen: Screen::Albums,
             rows,
@@ -108,6 +113,7 @@ impl App {
             field: 1,
             focus_tracks: false,
             editing: None,
+            show_help: false,
             confirm: false,
             armed: false,
             status,
@@ -162,6 +168,7 @@ impl App {
             return self.may_drop_draft("q");
         }
         match key.code {
+            KeyCode::Char('?') => self.show_help = !self.show_help,
             KeyCode::Char('s') if ctrl => self.save(),
             KeyCode::Tab => {
                 self.screen = match self.screen {
@@ -510,7 +517,45 @@ impl App {
             (Screen::Folders, _) => self.draw_tree(f, main),
             _ => self.draw_albums(f, main),
         }
-        f.render_widget(Paragraph::new(self.status.as_str()), status);
+        if !self.show_help {
+            f.render_widget(Paragraph::new(self.status.as_str()), status);
+            return;
+        }
+        let hints: &[(&str, &str)] = match self.screen {
+            Screen::Albums => &[("⏎", "open"), ("tab", "folders"), ("q", "quit")],
+            Screen::Folders => &[
+                ("⏎", "open"),
+                ("←→", "fold"),
+                ("tab", "editor"),
+                ("q", "quit"),
+            ],
+            Screen::Editor => &[
+                ("←→", "tracks/fields"),
+                ("⏎", "edit"),
+                ("d", "delete"),
+                ("c", "cover"),
+                ("u", "undo"),
+                ("^s", "save"),
+                ("esc", "back"),
+                ("q", "quit"),
+            ],
+        };
+        let key_style = Style::default()
+            .fg(Color::Rgb(190, 225, 255))
+            .add_modifier(Modifier::BOLD);
+        let cells =
+            Layout::horizontal(hints.iter().map(|(k, w)| {
+                Constraint::Length((k.chars().count() + 1 + w.chars().count()) as u16)
+            }))
+            .flex(Flex::SpaceBetween)
+            .split(status);
+        for ((key, word), cell) in hints.iter().zip(cells.iter()) {
+            let hint = Line::from(vec![
+                Span::styled(*key, key_style),
+                Span::raw(format!(" {word}")),
+            ]);
+            f.render_widget(hint, *cell);
+        }
     }
 
     fn draw_albums(&self, f: &mut ratatui::Frame, area: Rect) {
