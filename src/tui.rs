@@ -48,6 +48,12 @@ struct Open {
     from: Screen,
 }
 
+/// Text being typed into a field, with the cursor as a char index.
+struct Input {
+    text: String,
+    cursor: usize,
+}
+
 struct App {
     screen: Screen,
     albums: Vec<Album>,
@@ -59,6 +65,7 @@ struct App {
     /// Index into `field_rows(selection)`.
     field: usize,
     focus_tracks: bool,
+    editing: Option<Input>,
     status: String,
 }
 
@@ -76,6 +83,7 @@ impl App {
             track: 0,
             field: 1,
             focus_tracks: false,
+            editing: None,
             status,
         }
     }
@@ -99,6 +107,11 @@ impl App {
     fn key(&mut self, key: KeyEvent) -> bool {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         let ctrl_c = ctrl && key.code == KeyCode::Char('c');
+        // While typing, keys belong to the input (letters must not trigger shortcuts).
+        if self.editing.is_some() && !ctrl_c {
+            self.input_key(key.code);
+            return false;
+        }
         if ctrl_c || key.code == KeyCode::Char('q') {
             return true;
         }
@@ -208,6 +221,23 @@ impl App {
         }
     }
 
+    fn selection_mut(&mut self) -> &mut [Track] {
+        let Some(o) = &mut self.open else {
+            return &mut [];
+        };
+        match self.track {
+            0 => &mut o.tracks,
+            i => std::slice::from_mut(&mut o.tracks[i - 1]),
+        }
+    }
+
+    fn selected_key(&self) -> Option<ItemKey> {
+        field_rows(self.selection())
+            .get(self.field)
+            .copied()
+            .flatten()
+    }
+
     fn editor_key(&mut self, code: KeyCode) {
         let Some(tracks) = self.open.as_ref().map(|o| 1 + o.tracks.len()) else {
             return;
@@ -228,12 +258,85 @@ impl App {
             }
             KeyCode::Up | KeyCode::Char('k') => self.field = (self.field + fields - 1) % fields,
             KeyCode::Down | KeyCode::Char('j') => self.field = (self.field + 1) % fields,
+            KeyCode::Enter => self.start_edit(),
             _ => {}
         }
     }
 
     fn track_changed(&mut self) {
         self.field = self.field.min(field_rows(self.selection()).len() - 1);
+    }
+
+    /// Why the selected field can't be edited for the current selection, if it can't.
+    fn locked(&self) -> Option<String> {
+        let sel = self.selection();
+        let Some(key) = self.selected_key() else {
+            return Some("filenames are read-only".into());
+        };
+        // ponytail: multi-line values (lyrics) are read-only; open them in $EDITOR if needed.
+        if sel.iter().any(|t| tags::get(&t.draft, key).contains('\n')) {
+            return Some("multi-line values are read-only".into());
+        }
+        None
+    }
+
+    fn start_edit(&mut self) {
+        if let Some(why) = self.locked() {
+            self.status = why;
+            return;
+        }
+        let key = self.selected_key();
+        let text = key
+            .and_then(|k| tags::common(self.selection(), k))
+            .unwrap_or("")
+            .to_string();
+        self.editing = Some(Input {
+            cursor: text.chars().count(),
+            text,
+        });
+    }
+
+    fn input_key(&mut self, code: KeyCode) {
+        let Some(mut input) = self.editing.take() else {
+            return;
+        };
+        let len = input.text.chars().count();
+        let byte = |text: &str, at: usize| text.char_indices().nth(at).map_or(text.len(), |c| c.0);
+        match code {
+            KeyCode::Esc => return,
+            KeyCode::Enter => return self.commit(input.text),
+            KeyCode::Backspace if input.cursor > 0 => {
+                input.cursor -= 1;
+                input.text.remove(byte(&input.text, input.cursor));
+            }
+            KeyCode::Delete if input.cursor < len => {
+                input.text.remove(byte(&input.text, input.cursor));
+            }
+            KeyCode::Left => input.cursor = input.cursor.saturating_sub(1),
+            KeyCode::Right => input.cursor = (input.cursor + 1).min(len),
+            KeyCode::Home => input.cursor = 0,
+            KeyCode::End => input.cursor = len,
+            KeyCode::Char(c) => {
+                input.text.insert(byte(&input.text, input.cursor), c);
+                input.cursor += 1;
+            }
+            _ => {}
+        }
+        self.editing = Some(input);
+    }
+
+    /// Put a typed value into the draft of every selected track.
+    fn commit(&mut self, text: String) {
+        let Some(key) = self.selected_key() else {
+            return;
+        };
+        // An untouched <various> field must not wipe every track's value.
+        if text.is_empty() && tags::common(self.selection(), key).is_none() {
+            return;
+        }
+        for t in self.selection_mut() {
+            t.draft.insert(key, text.clone());
+        }
     }
 
     fn draw(&self, f: &mut ratatui::Frame) {
@@ -382,7 +485,10 @@ impl App {
             } else {
                 Style::default()
             };
-            let value = self.value_line(sel, *key, here);
+            let value = match (&self.editing, here) {
+                (Some(input), true) => Line::from(input_spans(input)),
+                _ => self.value_line(sel, *key, here),
+            };
             table_rows.push(TableRow::new(vec![
                 Cell::from(Span::styled(label, label_style)),
                 Cell::from(value),
@@ -519,6 +625,24 @@ fn or_none<'a>(s: &'a str, none: &'a str) -> &'a str {
     } else {
         s
     }
+}
+
+/// The text being typed, with the char under the cursor reversed.
+fn input_spans(input: &Input) -> Vec<Span<'static>> {
+    let chars: Vec<char> = input.text.chars().collect();
+    let before: String = chars[..input.cursor].iter().collect();
+    let at = chars.get(input.cursor).map_or(" ".into(), char::to_string);
+    let after: String = chars
+        .get(input.cursor + 1..)
+        .unwrap_or(&[])
+        .iter()
+        .collect();
+    let style = Style::default().fg(Color::Black).bg(Color::Yellow);
+    vec![
+        Span::styled(before, style),
+        Span::styled(at, style.add_modifier(Modifier::REVERSED)),
+        Span::styled(after, style),
+    ]
 }
 
 trait TerminalOps {
