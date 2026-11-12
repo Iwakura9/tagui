@@ -2,7 +2,7 @@
 //! a whole album or folder (track list on the left, fields and cover on the right).
 //! Edits stay in each track's draft; files change only on Ctrl+s.
 
-use crate::library::{self, Album, Tree};
+use crate::library::{self, Album, Row, Tree};
 use crate::tags::{self, Track, MAIN, MORE, NUMERIC};
 use anyhow::Result;
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
@@ -58,6 +58,7 @@ struct Input {
 
 struct App {
     screen: Screen,
+    rows: Vec<Row>,
     albums: Vec<Album>,
     album_cursor: usize,
     tree: Tree,
@@ -81,6 +82,7 @@ impl App {
         let status = format!("{} tracks in {} albums", rows.len(), albums.len());
         Self {
             screen: Screen::Albums,
+            rows,
             albums,
             album_cursor: 0,
             tree: Tree::new(root),
@@ -141,6 +143,7 @@ impl App {
             return self.may_drop_draft("q");
         }
         match key.code {
+            KeyCode::Char('s') if ctrl => self.save(),
             KeyCode::Tab => {
                 self.screen = match self.screen {
                     Screen::Albums => Screen::Folders,
@@ -391,6 +394,39 @@ impl App {
                 t.draft.insert(key, String::new());
             }
             self.status = format!("cleared {}", tags::label(key));
+        }
+    }
+
+    fn save(&mut self) {
+        let Some(o) = &mut self.open else {
+            return;
+        };
+        let mut saved = Vec::new();
+        let mut errors = Vec::new();
+        for t in o.tracks.iter_mut().filter(|t| t.dirty()) {
+            match t.save() {
+                Ok(()) => saved.push(t.path.clone()),
+                Err(e) => errors.push(format!("{e:#}")),
+            }
+        }
+        let first = o.tracks[0].path.clone();
+        self.status = match errors.first() {
+            None if saved.is_empty() => "nothing to save".into(),
+            None => format!("saved {} file(s)", saved.len()),
+            Some(e) => format!("saved {}, {} failed: {e}", saved.len(), errors.len()),
+        };
+        // Re-read the saved files into the album index; follow the open album.
+        for path in &saved {
+            if let (Some(i), Some(row)) = (
+                self.rows.iter().position(|r| &r.path == path),
+                library::row(path),
+            ) {
+                self.rows[i] = row;
+            }
+        }
+        self.albums = library::albums(&self.rows);
+        if let Some(i) = self.albums.iter().position(|a| a.tracks.contains(&first)) {
+            self.album_cursor = i;
         }
     }
 
@@ -880,6 +916,10 @@ mod tests {
         quit
     }
 
+    fn ctrl_s(app: &mut App) {
+        app.key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL));
+    }
+
     fn screen_text(app: &App) -> String {
         let mut terminal = ratatui::Terminal::new(TestBackend::new(100, 30)).unwrap();
         terminal.draw(|f| app.draw(f)).unwrap();
@@ -890,6 +930,36 @@ mod tests {
             .map(|row| row.iter().map(|c| c.symbol()).collect::<String>())
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    #[test]
+    fn batch_edit_an_album_and_save() {
+        let root = library("batch");
+        let mut app = App::new(root.clone());
+        assert_eq!(app.albums.len(), 1);
+
+        press(&mut app, "\n"); // open the album, "all" selected, field Artist
+        assert_eq!(app.screen, Screen::Editor);
+        assert_eq!(app.selection().len(), 3);
+        assert!(screen_text(&app).contains("Album Artist"));
+
+        press(&mut app, "jjj\n"); // Title: per track only
+        assert!(app.editing.is_none());
+        assert!(app.status.contains("track by track"));
+
+        press(&mut app, "jj\n\x08\x08\x08\x08Jazz\n"); // Genre: Rock -> Jazz
+        assert!(app.dirty());
+        assert!(screen_text(&app).contains("Jazz"));
+
+        assert!(!press(&mut app, "q"), "first q only warns");
+        ctrl_s(&mut app);
+        assert!(!app.dirty(), "{}", app.status);
+        for f in ["tiny.flac", "tiny.mp3", "tiny.m4a"] {
+            let t = Track::load(&root.join("Album").join(f)).unwrap();
+            assert_eq!(tags::get(&t.saved, ItemKey::Genre), "Jazz", "{f}");
+        }
+        assert!(press(&mut app, "q"), "nothing unsaved: q quits");
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]
