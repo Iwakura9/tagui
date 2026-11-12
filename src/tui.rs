@@ -220,14 +220,32 @@ impl App {
 
     /// What `/` looks through on the current screen, one text per list entry.
     fn search_entries(&self) -> Vec<String> {
-        self.albums
-            .iter()
-            .map(|a| format!("{} {}", a.album, a.artist))
-            .collect()
+        match self.screen {
+            Screen::Folders => self
+                .tree
+                .visible
+                .iter()
+                .map(|n| {
+                    n.path
+                        .file_name()
+                        .unwrap_or_default()
+                        .to_string_lossy()
+                        .into()
+                })
+                .collect(),
+            _ => self
+                .albums
+                .iter()
+                .map(|a| format!("{} {}", a.album, a.artist))
+                .collect(),
+        }
     }
 
     fn cursor_mut(&mut self) -> &mut usize {
-        &mut self.album_cursor
+        match self.screen {
+            Screen::Folders => &mut self.tree.cursor,
+            _ => &mut self.album_cursor,
+        }
     }
 
     fn start_search(&mut self) {
@@ -276,6 +294,7 @@ impl App {
             KeyCode::PageDown => self.tree.move_by(10),
             KeyCode::Left | KeyCode::Char('h') => self.tree.set_expanded(false),
             KeyCode::Right | KeyCode::Char('l') => self.tree.set_expanded(true),
+            KeyCode::Char('/') => self.start_search(),
             KeyCode::Enter => {
                 let Some(node) = self.tree.selected().cloned() else {
                     return;
@@ -593,6 +612,7 @@ impl App {
             ],
             Screen::Folders => &[
                 ("⏎", "open"),
+                ("/", "search"),
                 ("←→", "fold"),
                 ("tab", "editor"),
                 ("q", "quit"),
@@ -1280,6 +1300,11 @@ mod tests {
         assert_eq!(app.selection()[0].path, root.join("Album/tiny.m4a"));
         press(&mut app, "\x1b");
         assert_eq!(app.screen, Screen::Folders);
+        press(&mut app, "/MP3\n"); // visible entries only, case ignored
+        assert_eq!(
+            app.tree.selected().unwrap().path,
+            root.join("Album/tiny.mp3")
+        );
         std::fs::remove_dir_all(&root).unwrap();
     }
 

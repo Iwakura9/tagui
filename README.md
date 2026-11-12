@@ -44,6 +44,7 @@ then replaces the original, so a failed write never leaves a half-written file.
 | albums | `/` | search album or artist (`Enter` keeps the match, `Esc` goes back) |
 | folders | `←` / `→` | collapse / expand |
 | folders | `Enter` | open the folder's tracks (on a file: its folder, at that track) |
+| folders | `/` | search the visible folder and file names |
 | editor | `h` / `l` | focus tracks / fields |
 | editor | `j` / `k` | move |
 | editor | `Enter` | edit the field |
