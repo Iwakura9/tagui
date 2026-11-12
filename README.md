@@ -41,6 +41,7 @@ then replaces the original, so a failed write never leaves a half-written file.
 | anywhere | `?` | key hints |
 | albums | `j` / `k`, `PgUp` / `PgDn` | move |
 | albums | `Enter` | open the album |
+| albums | `/` | search album or artist (`Enter` keeps the match, `Esc` goes back) |
 | folders | `←` / `→` | collapse / expand |
 | folders | `Enter` | open the folder's tracks (on a file: its folder, at that track) |
 | editor | `h` / `l` | focus tracks / fields |

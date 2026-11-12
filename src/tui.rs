@@ -64,6 +64,12 @@ struct Input {
     cursor: usize,
 }
 
+/// A `/` search being typed in a list; Esc puts the cursor back at `origin`.
+struct Search {
+    query: String,
+    origin: usize,
+}
+
 /// The decoded cover on show.
 struct Cover {
     bytes: Vec<u8>,
@@ -84,6 +90,7 @@ struct App {
     field: usize,
     focus_tracks: bool,
     editing: Option<Input>,
+    search: Option<Search>,
     show_help: bool,
     /// An action that would drop unsaved edits asked once and waits for its repeat.
     confirm: bool,
@@ -113,6 +120,7 @@ impl App {
             field: 1,
             focus_tracks: false,
             editing: None,
+            search: None,
             show_help: false,
             confirm: false,
             armed: false,
@@ -160,6 +168,10 @@ impl App {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         let ctrl_c = ctrl && key.code == KeyCode::Char('c');
         // While typing, keys belong to the input (letters must not trigger shortcuts).
+        if self.search.is_some() && !ctrl_c {
+            self.search_key(key.code);
+            return false;
+        }
         if self.editing.is_some() && !ctrl_c {
             self.input_key(key.code);
             return false;
@@ -196,6 +208,7 @@ impl App {
             KeyCode::PageDown => *c = (*c + 10).min(last),
             KeyCode::Home => *c = 0,
             KeyCode::End => *c = last,
+            KeyCode::Char('/') => self.start_search(),
             KeyCode::Enter => {
                 if let Some(a) = self.albums.get(self.album_cursor).cloned() {
                     self.open_tracks(&a.tracks, album_title(&a), None);
@@ -203,6 +216,56 @@ impl App {
             }
             _ => {}
         }
+    }
+
+    /// What `/` looks through on the current screen, one text per list entry.
+    fn search_entries(&self) -> Vec<String> {
+        self.albums
+            .iter()
+            .map(|a| format!("{} {}", a.album, a.artist))
+            .collect()
+    }
+
+    fn cursor_mut(&mut self) -> &mut usize {
+        &mut self.album_cursor
+    }
+
+    fn start_search(&mut self) {
+        let origin = *self.cursor_mut();
+        self.search = Some(Search {
+            query: String::new(),
+            origin,
+        });
+        self.status = "/".into();
+    }
+
+    /// Typing moves the cursor to the first entry (from where the search started) that
+    /// contains the text; Enter keeps it there, Esc goes back.
+    fn search_key(&mut self, code: KeyCode) {
+        let Some(mut search) = self.search.take() else {
+            return;
+        };
+        match code {
+            KeyCode::Esc => {
+                *self.cursor_mut() = search.origin;
+                self.status.clear();
+                return;
+            }
+            KeyCode::Enter => {
+                self.status.clear();
+                return;
+            }
+            KeyCode::Backspace => {
+                search.query.pop();
+            }
+            KeyCode::Char(c) => search.query.push(c),
+            _ => {}
+        }
+        let found = find(&self.search_entries(), &search.query, search.origin);
+        *self.cursor_mut() = found.unwrap_or(search.origin);
+        let miss = if found.is_none() { "  (no match)" } else { "" };
+        self.status = format!("/{}{miss}", search.query);
+        self.search = Some(search);
     }
 
     fn folders_key(&mut self, code: KeyCode) {
@@ -517,12 +580,17 @@ impl App {
             (Screen::Folders, _) => self.draw_tree(f, main),
             _ => self.draw_albums(f, main),
         }
-        if !self.show_help {
+        if !self.show_help || self.search.is_some() {
             f.render_widget(Paragraph::new(self.status.as_str()), status);
             return;
         }
         let hints: &[(&str, &str)] = match self.screen {
-            Screen::Albums => &[("⏎", "open"), ("tab", "folders"), ("q", "quit")],
+            Screen::Albums => &[
+                ("⏎", "open"),
+                ("/", "search"),
+                ("tab", "folders"),
+                ("q", "quit"),
+            ],
             Screen::Folders => &[
                 ("⏎", "open"),
                 ("←→", "fold"),
@@ -777,6 +845,16 @@ impl App {
         }
         Line::from(Span::styled(text, style))
     }
+}
+
+/// First entry at or after `from` (wrapping) that contains `query`, ignoring case.
+// ponytail: plain lowercase match, "uteis" won't find "Úteis"; fold accents if that bites.
+fn find(entries: &[String], query: &str, from: usize) -> Option<usize> {
+    let query = query.to_lowercase();
+    let n = entries.len();
+    (0..n)
+        .map(|i| (from + i) % n)
+        .find(|&i| entries[i].to_lowercase().contains(&query))
 }
 
 /// The field list for a selection: Filename (`None`), `MAIN`, `MORE`, then every other
@@ -1158,6 +1236,35 @@ mod tests {
         press(&mut app, "u");
         assert!(!app.dirty());
         assert!(press(&mut app, "q"));
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn slash_searches_albums() {
+        let root = library("search");
+        let mut app = App::new(root.clone(), Picker::halfblocks());
+        let album = |album: &str, artist: &str| Album {
+            artist: artist.into(),
+            album: album.into(),
+            tracks: vec![],
+        };
+        app.albums = vec![
+            album("Dusk to Dawn", "Lamp"),
+            album("Timely!!", "Anri"),
+            album("Ampersands", "Mei Ehara"),
+        ];
+        assert!(!press(&mut app, "/ti"), "typing q-free text never quits");
+        assert_eq!(app.album_cursor, 1);
+        press(&mut app, "\x08\x08EHARA");
+        assert_eq!(app.album_cursor, 2, "artist matches, case ignored");
+        press(&mut app, "\x1b");
+        assert_eq!(app.album_cursor, 0, "Esc goes back");
+        press(&mut app, "/anri\n");
+        assert_eq!((app.album_cursor, app.search.is_none()), (1, true));
+        press(&mut app, "/zzq");
+        assert!(app.status.contains("no match"));
+        assert_eq!(app.album_cursor, 1);
+        press(&mut app, "\x1b");
         std::fs::remove_dir_all(&root).unwrap();
     }
 
