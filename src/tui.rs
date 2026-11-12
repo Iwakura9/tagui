@@ -457,7 +457,7 @@ impl App {
             query: String::new(),
             pick: 0,
         });
-        self.status = "type to filter · ↑↓ pick · ⏎ open · esc close".into();
+        self.status = "type to filter · ↑↓ pick · ⏎ edit · tab go to · esc close".into();
     }
 
     /// Albums (or folders, in Folders) whose name contains the query, ignoring case,
@@ -520,6 +520,17 @@ impl App {
                 }
                 return;
             }
+            KeyCode::Tab => {
+                let hit = self
+                    .search_results(&search.query)
+                    .into_iter()
+                    .nth(search.pick);
+                if let Some(hit) = hit {
+                    self.reveal_hit(hit);
+                }
+                self.status.clear();
+                return;
+            }
             KeyCode::Up => search.pick = search.pick.saturating_sub(1),
             KeyCode::Down => {
                 let last = self.search_results(&search.query).len().saturating_sub(1);
@@ -536,6 +547,25 @@ impl App {
             _ => {}
         }
         self.search = Some(search);
+    }
+
+    /// Put the list cursor on a result without opening it: on its album, or on it in the
+    /// folder tree (a song: its album, or its file).
+    fn reveal_hit(&mut self, hit: Hit) {
+        match hit {
+            Hit::Album(i) => self.album_cursor = i,
+            Hit::Folder(dir) => self.tree.reveal(&dir),
+            Hit::Song(i) if self.screen == Screen::Folders => {
+                let path = self.rows[i].path.clone();
+                self.tree.reveal(&path);
+            }
+            Hit::Song(i) => {
+                let path = &self.rows[i].path;
+                if let Some(a) = self.albums.iter().position(|a| a.tracks.contains(path)) {
+                    self.album_cursor = a;
+                }
+            }
+        }
     }
 
     /// Open a result in the editor; a song opens its album (or folder) at that track.
@@ -1926,6 +1956,28 @@ mod tests {
         press(&mut app, "\n");
         assert_eq!(app.screen, Screen::Editor);
         assert_eq!(app.selection()[0].path, app.rows[1].path);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn tab_in_search_goes_to_the_hit_without_opening_it() {
+        let root = library("search-tab");
+        let mut app = App::new(root.clone(), Picker::halfblocks());
+        let other = Album {
+            artist: "Lamp".into(),
+            album: "Ato".into(),
+            year: String::new(),
+            tracks: vec![],
+        };
+        app.albums.insert(0, other);
+        press(&mut app, "/song\t");
+        assert_eq!((app.screen, app.album_cursor), (Screen::Albums, 1));
+        assert!(app.search.is_none());
+
+        press(&mut app, "\t/song\t"); // Folders: the song's file, its folder expanded
+        assert_eq!(app.screen, Screen::Folders);
+        let file = &app.tree.selected().unwrap().path;
+        assert!(!file.is_dir() && file.parent() == Some(&root.join("Album")));
         std::fs::remove_dir_all(&root).unwrap();
     }
 
