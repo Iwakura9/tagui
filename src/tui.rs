@@ -3,7 +3,7 @@
 //! Edits stay in each track's draft; files change only on Ctrl+s.
 
 use crate::library::{self, Album, Tree};
-use crate::tags::{self, Track, MAIN, MORE};
+use crate::tags::{self, Track, MAIN, MORE, NUMERIC};
 use anyhow::Result;
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use crossterm::execute;
@@ -363,6 +363,10 @@ impl App {
         };
         // An untouched <various> field must not wipe every track's value.
         if text.is_empty() && tags::common(self.selection(), key).is_none() {
+            return;
+        }
+        if NUMERIC.contains(&key) && !text.chars().all(|c| c.is_ascii_digit()) {
+            self.status = format!("{} takes a whole number", tags::label(key));
             return;
         }
         for t in self.selection_mut() {
