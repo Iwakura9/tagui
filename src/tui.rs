@@ -1135,7 +1135,7 @@ impl App {
                     Span::styled(mark, Style::default().fg(Color::Green)),
                 ]),
                 Line::from(Span::styled(
-                    album_meta(a),
+                    album_meta(a, !grid),
                     Style::default().fg(Color::Cyan),
                 )),
             ];
@@ -1499,11 +1499,13 @@ fn album_title(a: &Album) -> String {
     )
 }
 
-/// "Artist · 2004 · 12 tracks", without the parts that are missing.
-fn album_meta(a: &Album) -> String {
+/// "Artist · 2004 · 12 tracks" (the year only when asked), without the parts that are
+/// missing.
+fn album_meta(a: &Album, year: bool) -> String {
     let n = a.tracks.len();
     let tracks = format!("{n} track{}", if n == 1 { "" } else { "s" });
-    [or_none(&a.artist, "(no artist)"), &a.year, &tracks]
+    let year = if year { a.year.as_str() } else { "" };
+    [or_none(&a.artist, "(no artist)"), year, &tracks]
         .iter()
         .filter(|s| !s.is_empty())
         .copied()
