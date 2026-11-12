@@ -35,8 +35,10 @@ use std::time::Duration;
 const COVER: Size = Size::new(20, 10);
 /// Thumbnail of each album in the rows view, in cells.
 const THUMB: Size = Size::new(6, 3);
-/// Cover of each album in the grid view, in cells; two lines of text go under it.
-const GRID: Size = Size::new(18, 9);
+/// Cover sizes of the grid view, in cells; two lines of text go under each cover.
+const GRID: [Size; 3] = [Size::new(16, 8), Size::new(18, 9), Size::new(20, 10)];
+/// Columns between grid covers, at least.
+const GRID_GAP: u16 = 2;
 /// Fields that differ per track by nature: not edited for a whole album at once.
 /// Fields the "all" row hides: they only make sense track by track.
 const PER_TRACK: [ItemKey; 2] = [ItemKey::TrackNumber, ItemKey::TrackTitle];
@@ -1134,11 +1136,17 @@ impl App {
         f.render_widget(block, area);
         let grid = self.album_view == AlbumView::Grid;
         let (thumb, cell) = if grid {
-            (GRID, Size::new(GRID.width + 2, GRID.height + 3))
+            let size = grid_size(inner.width);
+            (size, Size::new(size.width + GRID_GAP, size.height + 3))
         } else {
             (THUMB, Size::new(inner.width, THUMB.height))
         };
-        let cols = (inner.width / cell.width.max(1)).max(1) as usize;
+        let cols = ((inner.width + GRID_GAP) / cell.width.max(1)).max(1) as usize;
+        // What the columns leave unused goes evenly around them.
+        let width = if grid { thumb.width } else { inner.width };
+        let columns = Layout::horizontal(vec![Constraint::Length(width); cols])
+            .flex(Flex::SpaceEvenly)
+            .split(inner);
         let lines = (inner.height / cell.height).max(1) as usize;
         (self.tile_cols, self.tile_page) = (cols, cols * lines);
         let line = self.album_cursor / cols;
@@ -1152,18 +1160,13 @@ impl App {
         for i in (first..self.albums.len()).take(lines * cols) {
             let n = i - first;
             let tile = Rect::new(
-                inner.x + (n % cols) as u16 * cell.width,
+                columns[n % cols].x,
                 inner.y + (n / cols) as u16 * cell.height,
-                cell.width,
+                width,
                 cell.height,
             )
             .intersection(inner);
             let [pic, text] = if grid {
-                let tile = Rect {
-                    width: thumb.width,
-                    ..tile
-                }
-                .intersection(tile);
                 Layout::vertical([Constraint::Length(thumb.height), Constraint::Length(2)])
                     .areas(tile)
             } else {
@@ -1574,6 +1577,12 @@ fn album_meta(a: &Album) -> String {
         .join(" · ")
 }
 
+/// The grid cover size that leaves the least of `width` unused; the biggest on a tie.
+fn grid_size(width: u16) -> Size {
+    let unused = |s: &Size| (width + GRID_GAP) % (s.width + GRID_GAP);
+    GRID.into_iter().rev().min_by_key(unused).unwrap_or(GRID[0])
+}
+
 fn or_none<'a>(s: &'a str, none: &'a str) -> &'a str {
     if s.is_empty() {
         none
@@ -1949,14 +1958,23 @@ mod tests {
         app.albums = (0..7).map(|i| album(format!("A{i}"))).collect();
         press(&mut app, "vv");
         assert!(screen_text(&mut app).contains("· grid "));
-        assert_eq!(app.tile_cols, 4); // 98 cells inside the border, 20 per tile
+        // 98 cells inside the border: five 18-wide covers and four gaps of 2.
+        assert_eq!(app.tile_cols, 5);
         press(&mut app, "j");
-        assert_eq!(app.album_cursor, 4);
-        press(&mut app, "llj");
+        assert_eq!(app.album_cursor, 5);
+        press(&mut app, "lj");
         assert_eq!(app.album_cursor, 6);
-        press(&mut app, "hhk");
+        press(&mut app, "hk");
         assert_eq!(app.album_cursor, 0);
         std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn grid_size_leaves_the_least_width_unused() {
+        assert_eq!(grid_size(98), Size::new(18, 9)); // 5 × 18 + 4 × 2
+        assert_eq!(grid_size(88), Size::new(16, 8)); // 5 × 16 + 4 × 2
+        assert_eq!(grid_size(86), Size::new(20, 10)); // 4 × 20 + 3 × 2
+        assert_eq!(grid_size(10), Size::new(20, 10)); // too narrow: all tie
     }
 
     #[test]
