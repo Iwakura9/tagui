@@ -44,15 +44,13 @@ then replaces the original, so a failed write never leaves a half-written file.
 | anywhere | `?` | key hints |
 | albums | `j` / `k`, `PgUp` / `PgDn` | move |
 | albums | `Enter` | open the album |
-| albums | `/` | search album or artist (`Enter` keeps the match, `Esc` goes back) |
+| albums, folders | `/` | search albums (or folders) and songs: `Enter` opens the result in the editor, `Tab` goes to it in the list, `Esc` closes |
 | albums | `s` | sort by album / by artist |
 | albums | `v` | view: compact list / rows with the cover / grid of covers |
 | albums | `h` / `l` | move left / right (grid) |
 | folders | `←` / `→` | collapse / expand |
 | folders | `Enter` | open the folder's tracks (on a file: its folder, at that track) |
-| folders | `/` | search the visible folder and file names |
 | folders | `s` | sort by name / newest first (modification time) |
-| albums, folders | `n` / `N` | next / previous match of the last search |
 | editor | `h` / `l` | focus tracks / fields |
 | editor | `j` / `k` | move |
 | editor | `Tab` | next field |

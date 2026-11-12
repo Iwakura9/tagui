@@ -118,6 +118,21 @@ impl Tree {
 
     /// Expand/collapse the selected directory. Collapsing on a file jumps to (and
     /// collapses) its parent directory.
+    /// Expand the folders above `path` and put the cursor on it.
+    pub fn reveal(&mut self, path: &Path) {
+        let above: Vec<PathBuf> = path
+            .ancestors()
+            .skip(1)
+            .take_while(|d| d.starts_with(&self.root) && *d != self.root)
+            .map(Path::to_path_buf)
+            .collect();
+        self.expanded.extend(above);
+        self.refresh();
+        if let Some(i) = self.visible.iter().position(|n| n.path == path) {
+            self.cursor = i;
+        }
+    }
+
     pub fn set_expanded(&mut self, expand: bool) {
         let Some(node) = self.selected().cloned() else {
             return;
