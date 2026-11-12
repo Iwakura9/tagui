@@ -31,6 +31,8 @@ use std::path::{Path, PathBuf};
 const COVER: Size = Size::new(20, 10);
 /// Thumbnail of each album in the rows view, in cells.
 const THUMB: Size = Size::new(6, 3);
+/// Cover of each album in the grid view, in cells; two lines of text go under it.
+const GRID: Size = Size::new(16, 8);
 /// Fields that differ per track by nature: not edited for a whole album at once.
 /// Fields the "all" row hides: they only make sense track by track.
 const PER_TRACK: [ItemKey; 2] = [ItemKey::TrackNumber, ItemKey::TrackTitle];
@@ -67,6 +69,7 @@ enum Screen {
 enum AlbumView {
     Compact,
     Rows,
+    Grid,
 }
 
 impl AlbumView {
@@ -74,13 +77,15 @@ impl AlbumView {
         match self {
             AlbumView::Compact => "compact",
             AlbumView::Rows => "rows",
+            AlbumView::Grid => "grid",
         }
     }
 
     fn next(self) -> Self {
         match self {
             AlbumView::Compact => AlbumView::Rows,
-            AlbumView::Rows => AlbumView::Compact,
+            AlbumView::Rows => AlbumView::Grid,
+            AlbumView::Grid => AlbumView::Compact,
         }
     }
 }
@@ -156,7 +161,7 @@ struct App {
     /// Albums ordered by artist, else by album.
     albums_by_artist: bool,
     album_view: AlbumView,
-    /// First line of albums on show in the views that scroll themselves (rows).
+    /// First line of albums on show in the views that scroll themselves (rows, grid).
     album_top: usize,
     /// Albums per line and per screen at the last draw, for the keys that move by them.
     tile_cols: usize,
@@ -294,6 +299,12 @@ impl App {
             KeyCode::Down | KeyCode::Char('j') => *c = (*c + line).min(last),
             KeyCode::PageUp => *c = c.saturating_sub(page),
             KeyCode::PageDown => *c = (*c + page).min(last),
+            KeyCode::Left | KeyCode::Char('h') if self.album_view == AlbumView::Grid => {
+                *c = c.saturating_sub(1)
+            }
+            KeyCode::Right | KeyCode::Char('l') if self.album_view == AlbumView::Grid => {
+                *c = (*c + 1).min(last)
+            }
             KeyCode::Home => *c = 0,
             KeyCode::End => *c = last,
             KeyCode::Char('/') => self.start_search(),
@@ -1015,14 +1026,20 @@ impl App {
         )
     }
 
-    /// The albums as tiles with their cover: one per line in the rows view.
+    /// The albums as tiles with their cover: one per line in the rows view, as many as fit
+    /// the width in the grid.
     fn draw_album_tiles(&mut self, f: &mut ratatui::Frame, area: Rect) {
         let block = Block::default()
             .borders(Borders::ALL)
             .title(self.albums_title());
         let inner = block.inner(area);
         f.render_widget(block, area);
-        let (thumb, cell) = (THUMB, Size::new(inner.width, THUMB.height));
+        let grid = self.album_view == AlbumView::Grid;
+        let (thumb, cell) = if grid {
+            (GRID, Size::new(GRID.width + 2, GRID.height + 3))
+        } else {
+            (THUMB, Size::new(inner.width, THUMB.height))
+        };
         let cols = (inner.width / cell.width.max(1)).max(1) as usize;
         let lines = (inner.height / cell.height).max(1) as usize;
         (self.tile_cols, self.tile_page) = (cols, cols * lines);
@@ -1043,9 +1060,18 @@ impl App {
                 cell.height,
             )
             .intersection(inner);
-            let [pic, text] =
+            let [pic, text] = if grid {
+                let tile = Rect {
+                    width: thumb.width,
+                    ..tile
+                }
+                .intersection(tile);
+                Layout::vertical([Constraint::Length(thumb.height), Constraint::Length(2)])
+                    .areas(tile)
+            } else {
                 Layout::horizontal([Constraint::Length(thumb.width + 1), Constraint::Min(1)])
-                    .areas(tile);
+                    .areas(tile)
+            };
             let a = &self.albums[i];
             let mark = if open.as_ref().is_some_and(|p| a.tracks.contains(p)) {
                 " ●"
@@ -1785,8 +1811,31 @@ mod tests {
         assert!(screen.contains("· rows "));
         assert!(screen.contains("Album Artist · 3 tracks"));
         assert!(app.thumbs.values().all(Option::is_some) && !app.thumbs.is_empty());
-        press(&mut app, "v");
+        press(&mut app, "vv");
         assert!(screen_text(&mut app).contains("· compact "));
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn grid_moves_by_line_and_column() {
+        let root = library("album-grid");
+        let mut app = App::new(root.clone(), Picker::halfblocks());
+        let album = |album: String| Album {
+            artist: "Lamp".into(),
+            album,
+            year: String::new(),
+            tracks: vec![],
+        };
+        app.albums = (0..7).map(|i| album(format!("A{i}"))).collect();
+        press(&mut app, "vv");
+        assert!(screen_text(&mut app).contains("· grid "));
+        assert_eq!(app.tile_cols, 5); // 98 cells inside the border, 18 per tile
+        press(&mut app, "j");
+        assert_eq!(app.album_cursor, 5);
+        press(&mut app, "lj");
+        assert_eq!(app.album_cursor, 6);
+        press(&mut app, "hk");
+        assert_eq!(app.album_cursor, 0);
         std::fs::remove_dir_all(&root).unwrap();
     }
 

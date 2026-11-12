@@ -43,7 +43,8 @@ then replaces the original, so a failed write never leaves a half-written file.
 | albums | `Enter` | open the album |
 | albums | `/` | search album or artist (`Enter` keeps the match, `Esc` goes back) |
 | albums | `s` | sort by album / by artist |
-| albums | `v` | view: compact list / rows with the cover |
+| albums | `v` | view: compact list / rows with the cover / grid of covers |
+| albums | `h` / `l` | move left / right (grid) |
 | folders | `←` / `→` | collapse / expand |
 | folders | `Enter` | open the folder's tracks (on a file: its folder, at that track) |
 | folders | `/` | search the visible folder and file names |
