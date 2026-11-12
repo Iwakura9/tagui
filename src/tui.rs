@@ -21,6 +21,8 @@ use ratatui::widgets::{
 use std::io::{stdout, Stdout};
 use std::path::{Path, PathBuf};
 
+/// Fields that differ per track by nature: not edited for a whole album at once.
+const PER_TRACK: [ItemKey; 2] = [ItemKey::TrackNumber, ItemKey::TrackTitle];
 /// Index of the first `MORE` field in the field list (after Filename and `MAIN`).
 const FIRST_MORE: usize = 1 + MAIN.len();
 const VARIOUS: &str = "<various>";
@@ -299,6 +301,9 @@ impl App {
         let Some(key) = self.selected_key() else {
             return Some("filenames are read-only".into());
         };
+        if self.track == 0 && sel.len() > 1 && PER_TRACK.contains(&key) {
+            return Some(format!("{} is edited track by track", tags::label(key)));
+        }
         // ponytail: multi-line values (lyrics) are read-only; open them in $EDITOR if needed.
         if sel.iter().any(|t| tags::get(&t.draft, key).contains('\n')) {
             return Some("multi-line values are read-only".into());
