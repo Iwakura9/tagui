@@ -206,6 +206,18 @@ pub fn albums(rows: &[Row]) -> Vec<Album> {
         .collect()
 }
 
+/// Order albums by artist then album, or by album then artist, ignoring case.
+pub fn sort_albums(albums: &mut [Album], by_artist: bool) {
+    albums.sort_by_cached_key(|a| {
+        let (artist, album) = (a.artist.to_lowercase(), a.album.to_lowercase());
+        if by_artist {
+            (artist, album)
+        } else {
+            (album, artist)
+        }
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -281,6 +293,25 @@ mod tests {
             .map(|p| p.to_str().unwrap())
             .collect();
         assert_eq!(order, ["z/1", "z/2", "z/10"]);
+    }
+
+    #[test]
+    fn sort_albums_by_album_or_artist() {
+        let a = |artist: &str, album: &str| Album {
+            artist: artist.into(),
+            album: album.into(),
+            tracks: vec![],
+        };
+        let mut albums = vec![
+            a("Lamp", "Ato"),
+            a("anri", "Timely!"),
+            a("Anri", "bi・ki・ni"),
+        ];
+        let names = |albums: &[Album]| albums.iter().map(|a| a.album.clone()).collect::<Vec<_>>();
+        sort_albums(&mut albums, false);
+        assert_eq!(names(&albums), ["Ato", "bi・ki・ni", "Timely!"]);
+        sort_albums(&mut albums, true);
+        assert_eq!(names(&albums), ["bi・ki・ni", "Timely!", "Ato"]);
     }
 
     #[test]
