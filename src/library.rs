@@ -4,6 +4,7 @@ use lofty::config::ParseOptions;
 use lofty::file::{FileType, TaggedFileExt};
 use lofty::probe::Probe;
 use lofty::tag::ItemKey;
+use std::cmp::Reverse;
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 
@@ -13,8 +14,8 @@ pub fn is_audio(path: &Path) -> bool {
 }
 
 /// Visible, non-hidden entries of `dir`: directories first, then audio files, each
-/// alphabetical.
-fn entries(dir: &Path) -> Vec<(bool, PathBuf)> {
+/// alphabetical, or newest first (by modification time) when `by_date`.
+fn entries(dir: &Path, by_date: bool) -> Vec<(bool, PathBuf)> {
     let Ok(read) = std::fs::read_dir(dir) else {
         return Vec::new();
     };
@@ -25,12 +26,19 @@ fn entries(dir: &Path) -> Vec<(bool, PathBuf)> {
         .filter(|(is_dir, p)| *is_dir || is_audio(p))
         .collect();
     out.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+    if by_date {
+        // Stable: ties keep the alphabetical order.
+        out.sort_by_cached_key(|(is_dir, p)| {
+            let modified = std::fs::metadata(p).and_then(|m| m.modified()).ok();
+            (!is_dir, Reverse(modified))
+        });
+    }
     out
 }
 
 /// Audio files directly inside `dir`, alphabetical.
 pub fn audio_in(dir: &Path) -> Vec<PathBuf> {
-    entries(dir)
+    entries(dir, false)
         .into_iter()
         .filter(|(is_dir, _)| !is_dir)
         .map(|(_, p)| p)
@@ -49,6 +57,8 @@ pub struct Tree {
     pub expanded: HashSet<PathBuf>,
     pub visible: Vec<Node>,
     pub cursor: usize,
+    /// Newest first instead of alphabetical.
+    pub by_date: bool,
 }
 
 impl Tree {
@@ -58,6 +68,7 @@ impl Tree {
             expanded: HashSet::new(),
             visible: Vec::new(),
             cursor: 0,
+            by_date: false,
         };
         tree.refresh();
         tree
@@ -72,7 +83,7 @@ impl Tree {
     }
 
     fn walk(&mut self, dir: &Path, depth: usize) {
-        for (is_dir, path) in entries(dir) {
+        for (is_dir, path) in entries(dir, self.by_date) {
             self.visible.push(Node {
                 path: path.clone(),
                 depth,
@@ -81,6 +92,16 @@ impl Tree {
             if is_dir && self.expanded.contains(&path) {
                 self.walk(&path, depth + 1);
             }
+        }
+    }
+
+    /// Switch between alphabetical and newest first, staying on the same entry.
+    pub fn toggle_order(&mut self) {
+        let keep = self.selected().map(|n| n.path.clone());
+        self.by_date = !self.by_date;
+        self.refresh();
+        if let Some(i) = keep.and_then(|p| self.visible.iter().position(|n| n.path == p)) {
+            self.cursor = i;
         }
     }
 
@@ -175,7 +196,7 @@ pub fn scan(root: &Path) -> Vec<Row> {
     let mut rows = Vec::new();
     let mut dirs = vec![root.to_path_buf()];
     while let Some(dir) = dirs.pop() {
-        for (is_dir, path) in entries(&dir) {
+        for (is_dir, path) in entries(&dir, false) {
             if is_dir {
                 dirs.push(path);
             } else if let Some(r) = row(&path) {
@@ -204,6 +225,18 @@ pub fn albums(rows: &[Row]) -> Vec<Album> {
             }
         })
         .collect()
+}
+
+/// Order albums by artist then album, or by album then artist, ignoring case.
+pub fn sort_albums(albums: &mut [Album], by_artist: bool) {
+    albums.sort_by_cached_key(|a| {
+        let (artist, album) = (a.artist.to_lowercase(), a.album.to_lowercase());
+        if by_artist {
+            (artist, album)
+        } else {
+            (album, artist)
+        }
+    });
 }
 
 #[cfg(test)]
@@ -247,6 +280,42 @@ mod tests {
     }
 
     #[test]
+    fn toggle_order_puts_newest_first_and_keeps_the_cursor() {
+        let root = std::env::temp_dir().join(format!("tagui-order-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+        for (name, age) in [("A", Some(old)), ("B", None), ("C", Some(old))] {
+            std::fs::create_dir(root.join(name)).unwrap();
+            if let Some(t) = age {
+                std::fs::File::open(root.join(name))
+                    .unwrap()
+                    .set_modified(t)
+                    .unwrap();
+            }
+        }
+        std::fs::write(root.join("z.flac"), "").unwrap();
+        let names = |tree: &Tree| {
+            tree.visible
+                .iter()
+                .map(|n| n.path.file_name().unwrap().to_str().unwrap().to_owned())
+                .collect::<Vec<_>>()
+        };
+        let mut tree = Tree::new(root.clone());
+        tree.cursor = 2;
+        tree.toggle_order();
+        assert_eq!(
+            names(&tree),
+            ["B", "A", "C", "z.flac"],
+            "dirs first, newest first"
+        );
+        assert_eq!(tree.cursor, 2, "still on C");
+        tree.toggle_order();
+        assert_eq!(names(&tree), ["A", "B", "C", "z.flac"]);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
     fn albums_group_ignoring_case_and_sort_tracks() {
         let r = |path: &str, artist: &str, album: &str, disc, track| Row {
             path: path.into(),
@@ -281,6 +350,25 @@ mod tests {
             .map(|p| p.to_str().unwrap())
             .collect();
         assert_eq!(order, ["z/1", "z/2", "z/10"]);
+    }
+
+    #[test]
+    fn sort_albums_by_album_or_artist() {
+        let a = |artist: &str, album: &str| Album {
+            artist: artist.into(),
+            album: album.into(),
+            tracks: vec![],
+        };
+        let mut albums = vec![
+            a("Lamp", "Ato"),
+            a("anri", "Timely!"),
+            a("Anri", "bi・ki・ni"),
+        ];
+        let names = |albums: &[Album]| albums.iter().map(|a| a.album.clone()).collect::<Vec<_>>();
+        sort_albums(&mut albums, false);
+        assert_eq!(names(&albums), ["Ato", "bi・ki・ni", "Timely!"]);
+        sort_albums(&mut albums, true);
+        assert_eq!(names(&albums), ["bi・ki・ni", "Timely!", "Ato"]);
     }
 
     #[test]

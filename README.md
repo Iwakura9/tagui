@@ -42,9 +42,11 @@ then replaces the original, so a failed write never leaves a half-written file.
 | albums | `j` / `k`, `PgUp` / `PgDn` | move |
 | albums | `Enter` | open the album |
 | albums | `/` | search album or artist (`Enter` keeps the match, `Esc` goes back) |
+| albums | `s` | sort by album / by artist |
 | folders | `←` / `→` | collapse / expand |
 | folders | `Enter` | open the folder's tracks (on a file: its folder, at that track) |
 | folders | `/` | search the visible folder and file names |
+| folders | `s` | sort by name / newest first (modification time) |
 | albums, folders | `n` / `N` | next / previous match of the last search |
 | editor | `h` / `l` | focus tracks / fields |
 | editor | `j` / `k` | move |

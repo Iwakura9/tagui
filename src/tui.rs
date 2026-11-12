@@ -82,6 +82,8 @@ struct App {
     rows: Vec<Row>,
     albums: Vec<Album>,
     album_cursor: usize,
+    /// Albums ordered by artist, else by album.
+    albums_by_artist: bool,
     tree: Tree,
     open: Option<Open>,
     /// 0 = all tracks, 1.. = `tracks[track - 1]`.
@@ -105,7 +107,8 @@ struct App {
 impl App {
     fn new(root: PathBuf, picker: Picker) -> Self {
         let rows = library::scan(&root);
-        let albums = library::albums(&rows);
+        let mut albums = library::albums(&rows);
+        library::sort_albums(&mut albums, false);
         let status = format!(
             "{} tracks in {} albums · ? for help",
             rows.len(),
@@ -116,6 +119,7 @@ impl App {
             rows,
             albums,
             album_cursor: 0,
+            albums_by_artist: false,
             tree: Tree::new(root),
             open: None,
             track: 0,
@@ -214,12 +218,37 @@ impl App {
             KeyCode::Char('/') => self.start_search(),
             KeyCode::Char('n') => self.next_match(true),
             KeyCode::Char('N') => self.next_match(false),
+            KeyCode::Char('s') => {
+                let keep = self.albums.get(self.album_cursor).cloned();
+                self.albums_by_artist = !self.albums_by_artist;
+                library::sort_albums(&mut self.albums, self.albums_by_artist);
+                if let Some(i) = keep.and_then(|k| self.albums.iter().position(|a| *a == k)) {
+                    self.album_cursor = i;
+                }
+                self.status = format!("albums by {}", self.album_order());
+            }
             KeyCode::Enter => {
                 if let Some(a) = self.albums.get(self.album_cursor).cloned() {
                     self.open_tracks(&a.tracks, album_title(&a), None);
                 }
             }
             _ => {}
+        }
+    }
+
+    fn album_order(&self) -> &'static str {
+        if self.albums_by_artist {
+            "artist"
+        } else {
+            "album"
+        }
+    }
+
+    fn folder_order(&self) -> &'static str {
+        if self.tree.by_date {
+            "date"
+        } else {
+            "name"
         }
     }
 
@@ -321,6 +350,10 @@ impl App {
             KeyCode::PageDown => self.tree.move_by(10),
             KeyCode::Left | KeyCode::Char('h') => self.tree.set_expanded(false),
             KeyCode::Right | KeyCode::Char('l') => self.tree.set_expanded(true),
+            KeyCode::Char('s') => {
+                self.tree.toggle_order();
+                self.status = format!("folders by {}", self.folder_order());
+            }
             KeyCode::Char('/') => self.start_search(),
             KeyCode::Char('n') => self.next_match(true),
             KeyCode::Char('N') => self.next_match(false),
@@ -591,6 +624,7 @@ impl App {
             }
         }
         self.albums = library::albums(&self.rows);
+        library::sort_albums(&mut self.albums, self.albums_by_artist);
         if let Some(i) = self.albums.iter().position(|a| a.tracks.contains(&first)) {
             self.album_cursor = i;
         }
@@ -637,6 +671,7 @@ impl App {
                 ("⏎", "open"),
                 ("/", "search"),
                 ("n/N", "next"),
+                ("s", "sort"),
                 ("tab", "folders"),
                 ("q", "quit"),
             ],
@@ -644,6 +679,7 @@ impl App {
                 ("⏎", "open"),
                 ("/", "search"),
                 ("n/N", "next"),
+                ("s", "sort"),
                 ("←→", "fold"),
                 ("tab", "editor"),
                 ("q", "quit"),
@@ -705,7 +741,11 @@ impl App {
                 ]))
             })
             .collect();
-        let title = format!(" albums · {} ", self.tree.root.display());
+        let title = format!(
+            " albums · {} · by {} ",
+            self.tree.root.display(),
+            self.album_order()
+        );
         let list = List::new(items)
             .block(Block::default().borders(Borders::ALL).title(title))
             .highlight_style(Style::default().add_modifier(Modifier::REVERSED));
@@ -736,11 +776,11 @@ impl App {
             })
             .collect();
         let list = List::new(items)
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .title(format!(" {} ", self.tree.root.display())),
-            )
+            .block(Block::default().borders(Borders::ALL).title(format!(
+                " {} · by {} ",
+                self.tree.root.display(),
+                self.folder_order()
+            )))
             .highlight_style(Style::default().add_modifier(Modifier::REVERSED));
         let mut state = ListState::default().with_selected(Some(self.tree.cursor));
         f.render_stateful_widget(list, area, &mut state);
@@ -1317,6 +1357,26 @@ mod tests {
         assert!(app.status.contains("no match"));
         assert_eq!(app.album_cursor, 1);
         press(&mut app, "\x1b");
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn s_toggles_the_album_order_keeping_the_cursor() {
+        let root = library("album-sort");
+        let mut app = App::new(root.clone(), Picker::halfblocks());
+        let album = |album: &str, artist: &str| Album {
+            artist: artist.into(),
+            album: album.into(),
+            tracks: vec![],
+        };
+        app.albums = vec![album("Ato", "Lamp"), album("Timely!!", "Anri")];
+        app.album_cursor = 0;
+        press(&mut app, "s");
+        assert_eq!(app.albums[0].album, "Timely!!");
+        assert_eq!(app.albums[app.album_cursor].album, "Ato");
+        assert!(screen_text(&app).contains("by artist"));
+        press(&mut app, "s");
+        assert_eq!((app.albums[0].album.as_str(), app.album_cursor), ("Ato", 0));
         std::fs::remove_dir_all(&root).unwrap();
     }
 
