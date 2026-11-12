@@ -288,6 +288,12 @@ impl App {
             KeyCode::Down | KeyCode::Char('j') => self.field = (self.field + 1) % fields,
             KeyCode::Enter => self.start_edit(),
             KeyCode::Char('d') => self.clear_field(),
+            KeyCode::Char('u') => {
+                for t in self.open.iter_mut().flat_map(|o| &mut o.tracks) {
+                    t.discard();
+                }
+                self.status = "dropped unsaved changes".into();
+            }
             _ => {}
         }
     }
@@ -845,6 +851,7 @@ mod terminal_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ratatui::backend::TestBackend;
 
     const FIXTURES: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures");
 
@@ -871,6 +878,50 @@ mod tests {
             quit = app.key(KeyEvent::from(code));
         }
         quit
+    }
+
+    fn screen_text(app: &App) -> String {
+        let mut terminal = ratatui::Terminal::new(TestBackend::new(100, 30)).unwrap();
+        terminal.draw(|f| app.draw(f)).unwrap();
+        let buffer = terminal.backend().buffer();
+        buffer
+            .content()
+            .chunks(buffer.area.width as usize)
+            .map(|row| row.iter().map(|c| c.symbol()).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn per_track_edit_and_various() {
+        let root = library("track");
+        let mut app = App::new(root.clone());
+        press(&mut app, "\nhj\njjj\n\x08\x08\x08\x08Intro\n"); // track 1 title
+        assert_eq!(app.selection().len(), 1);
+        press(&mut app, "hk"); // back to "all"
+        assert_eq!(app.track, 0);
+        assert!(screen_text(&app).contains(VARIOUS));
+        // An untouched <various> field stays as it was.
+        press(&mut app, "l");
+        let before: Vec<_> = app.selection().iter().map(|t| t.draft.clone()).collect();
+        app.field = 4;
+        app.editing = Some(Input {
+            text: String::new(),
+            cursor: 0,
+        });
+        press(&mut app, "\n");
+        let after: Vec<_> = app.selection().iter().map(|t| t.draft.clone()).collect();
+        assert_eq!(before, after);
+
+        // Numbers only in numeric fields; u drops everything.
+        app.track = 1;
+        app.field = 3;
+        press(&mut app, "\n\x08x\n");
+        assert!(app.status.contains("whole number"));
+        press(&mut app, "u");
+        assert!(!app.dirty());
+        assert!(press(&mut app, "q"));
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]
