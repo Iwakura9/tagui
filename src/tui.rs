@@ -2,6 +2,7 @@
 //! a whole album or folder (track list on the left, fields and cover on the right).
 //! Edits stay in each track's draft; files change only on Ctrl+s.
 
+use crate::config;
 use crate::library::{self, Album, Row, Tree};
 use crate::tags::{self, Track, MAIN, MORE, NUMERIC};
 use anyhow::Result;
@@ -54,7 +55,10 @@ pub fn run(root: PathBuf) -> Result<()> {
     let mut terminal = ratatui::Terminal::new(CrosstermBackend::new(stdout()))?;
     let scanning = format!("scanning {}…", root.display());
     terminal.draw(|f| f.render_widget(Paragraph::new(scanning.as_str()), f.area()))?;
-    App::new(root, picker).event_loop(&mut terminal)
+    let mut app = App::new(root, picker);
+    app.apply(&config::load());
+    app.event_loop(&mut terminal)?;
+    config::save(&app.settings())
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -80,6 +84,8 @@ impl AlbumView {
             AlbumView::Grid => "grid",
         }
     }
+
+    const ALL: [AlbumView; 3] = [AlbumView::Compact, AlbumView::Rows, AlbumView::Grid];
 
     fn next(self) -> Self {
         match self {
@@ -221,6 +227,48 @@ impl App {
             status,
             picker,
             cover: None,
+        }
+    }
+
+    /// What `config` keeps between runs: the album view, both orders and the screen.
+    fn settings(&self) -> Vec<(&'static str, &'static str)> {
+        let screen = match self.open.as_ref().filter(|_| self.screen == Screen::Editor) {
+            Some(o) => o.from,
+            None => self.screen,
+        };
+        vec![
+            ("view", self.album_view.name()),
+            ("albums", self.album_order()),
+            ("folders", self.folder_order()),
+            (
+                "screen",
+                if screen == Screen::Folders {
+                    "folders"
+                } else {
+                    "albums"
+                },
+            ),
+        ]
+    }
+
+    /// Restore `settings`; unknown keys and values are left at their default.
+    fn apply(&mut self, settings: &HashMap<String, String>) {
+        let get = |key: &str| settings.get(key).map(String::as_str);
+        if let Some(v) = AlbumView::ALL
+            .into_iter()
+            .find(|v| get("view") == Some(v.name()))
+        {
+            self.album_view = v;
+        }
+        if get("albums") == Some("artist") {
+            self.albums_by_artist = true;
+            library::sort_albums(&mut self.albums, true);
+        }
+        if get("folders") == Some("date") && !self.tree.by_date {
+            self.tree.toggle_order();
+        }
+        if get("screen") == Some("folders") {
+            self.screen = Screen::Folders;
         }
     }
 
@@ -1666,6 +1714,7 @@ mod tests {
         for c in keys.chars() {
             let code = match c {
                 '\n' => KeyCode::Enter,
+                '\t' => KeyCode::Tab,
                 '\x08' => KeyCode::Backspace,
                 '\x1b' => KeyCode::Esc,
                 c => KeyCode::Char(c),
@@ -1836,6 +1885,32 @@ mod tests {
         assert_eq!(app.album_cursor, 6);
         press(&mut app, "hk");
         assert_eq!(app.album_cursor, 0);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn settings_round_trip() {
+        let root = library("settings");
+        let mut app = App::new(root.clone(), Picker::halfblocks());
+        let defaults = app.settings();
+        press(&mut app, "vs\ts\n"); // rows, by artist, folders by date, open the folder
+        let saved = app.settings();
+        assert_eq!(
+            saved,
+            [
+                ("view", "rows"),
+                ("albums", "artist"),
+                ("folders", "date"),
+                ("screen", "folders")
+            ]
+        );
+        let text: String = saved.iter().map(|(k, v)| format!("{k}={v}\n")).collect();
+        let mut fresh = App::new(root.clone(), Picker::halfblocks());
+        fresh.apply(&config::parse(&text));
+        assert_eq!(fresh.settings(), saved);
+        let mut bad = App::new(root.clone(), Picker::halfblocks());
+        bad.apply(&config::parse("view=huge\nscreen=editor"));
+        assert_eq!(bad.settings(), defaults);
         std::fs::remove_dir_all(&root).unwrap();
     }
 

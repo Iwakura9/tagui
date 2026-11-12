@@ -19,6 +19,9 @@ tagui [DIR]
 `DIR` defaults to `~/.config/tagui/library`. Symlinking it to your music folder works
 well.
 
+The album view, both sort orders and the last screen (albums or folders) are remembered
+in `~/.config/tagui/config`.
+
 Albums are grouped by album artist (or artist) and album. Opening an album or a folder
 shows its tracks on the left, with `all` on top: editing a field there writes it to every
 track (Filename, Title and Track number only show track by track). A field whose tracks disagree
