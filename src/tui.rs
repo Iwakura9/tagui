@@ -91,6 +91,8 @@ struct App {
     focus_tracks: bool,
     editing: Option<Input>,
     search: Option<Search>,
+    /// The last confirmed search, repeated by n / N.
+    last_search: String,
     show_help: bool,
     /// An action that would drop unsaved edits asked once and waits for its repeat.
     confirm: bool,
@@ -121,6 +123,7 @@ impl App {
             focus_tracks: false,
             editing: None,
             search: None,
+            last_search: String::new(),
             show_help: false,
             confirm: false,
             armed: false,
@@ -209,6 +212,8 @@ impl App {
             KeyCode::Home => *c = 0,
             KeyCode::End => *c = last,
             KeyCode::Char('/') => self.start_search(),
+            KeyCode::Char('n') => self.next_match(true),
+            KeyCode::Char('N') => self.next_match(false),
             KeyCode::Enter => {
                 if let Some(a) = self.albums.get(self.album_cursor).cloned() {
                     self.open_tracks(&a.tracks, album_title(&a), None);
@@ -271,6 +276,7 @@ impl App {
             }
             KeyCode::Enter => {
                 self.status.clear();
+                self.last_search = search.query;
                 return;
             }
             KeyCode::Backspace => {
@@ -279,11 +285,32 @@ impl App {
             KeyCode::Char(c) => search.query.push(c),
             _ => {}
         }
-        let found = find(&self.search_entries(), &search.query, search.origin);
+        let found = find(&self.search_entries(), &search.query, search.origin, true);
         *self.cursor_mut() = found.unwrap_or(search.origin);
         let miss = if found.is_none() { "  (no match)" } else { "" };
         self.status = format!("/{}{miss}", search.query);
         self.search = Some(search);
+    }
+
+    /// n / N: move to the next / previous entry matching the last search.
+    fn next_match(&mut self, forward: bool) {
+        if self.last_search.is_empty() {
+            self.status = "no search yet: / to search".into();
+            return;
+        }
+        let entries = self.search_entries();
+        let n = entries.len();
+        if n == 0 {
+            return;
+        }
+        let cursor = *self.cursor_mut();
+        let from = (if forward { cursor + 1 } else { cursor + n - 1 }) % n;
+        let found = find(&entries, &self.last_search, from, forward);
+        let miss = if found.is_none() { "  (no match)" } else { "" };
+        self.status = format!("/{}{miss}", self.last_search);
+        if let Some(i) = found {
+            *self.cursor_mut() = i;
+        }
     }
 
     fn folders_key(&mut self, code: KeyCode) {
@@ -295,6 +322,8 @@ impl App {
             KeyCode::Left | KeyCode::Char('h') => self.tree.set_expanded(false),
             KeyCode::Right | KeyCode::Char('l') => self.tree.set_expanded(true),
             KeyCode::Char('/') => self.start_search(),
+            KeyCode::Char('n') => self.next_match(true),
+            KeyCode::Char('N') => self.next_match(false),
             KeyCode::Enter => {
                 let Some(node) = self.tree.selected().cloned() else {
                     return;
@@ -607,12 +636,14 @@ impl App {
             Screen::Albums => &[
                 ("⏎", "open"),
                 ("/", "search"),
+                ("n/N", "next"),
                 ("tab", "folders"),
                 ("q", "quit"),
             ],
             Screen::Folders => &[
                 ("⏎", "open"),
                 ("/", "search"),
+                ("n/N", "next"),
                 ("←→", "fold"),
                 ("tab", "editor"),
                 ("q", "quit"),
@@ -867,13 +898,14 @@ impl App {
     }
 }
 
-/// First entry at or after `from` (wrapping) that contains `query`, ignoring case.
+/// First entry from `from` on (wrapping, backwards unless `forward`) that contains
+/// `query`, ignoring case.
 // ponytail: plain lowercase match, "uteis" won't find "Úteis"; fold accents if that bites.
-fn find(entries: &[String], query: &str, from: usize) -> Option<usize> {
+fn find(entries: &[String], query: &str, from: usize, forward: bool) -> Option<usize> {
     let query = query.to_lowercase();
     let n = entries.len();
     (0..n)
-        .map(|i| (from + i) % n)
+        .map(|i| (if forward { from + i } else { from + n - i }) % n)
         .find(|&i| entries[i].to_lowercase().contains(&query))
 }
 
@@ -1285,6 +1317,36 @@ mod tests {
         assert!(app.status.contains("no match"));
         assert_eq!(app.album_cursor, 1);
         press(&mut app, "\x1b");
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn n_and_shift_n_repeat_the_search() {
+        let entries = ["a lamp", "b", "c lamp", "d"].map(String::from);
+        assert_eq!(find(&entries, "LAMP", 1, true), Some(2));
+        assert_eq!(find(&entries, "lamp", 1, false), Some(0));
+        assert_eq!(find(&entries, "lamp", 3, true), Some(0), "wraps");
+        assert_eq!(find(&entries, "x", 0, true), None);
+
+        let root = library("next");
+        let mut app = App::new(root.clone(), Picker::halfblocks());
+        press(&mut app, "n");
+        assert!(app.status.contains("no search yet"));
+        app.albums = ["Lamp A", "Anri", "Lamp B"]
+            .map(|name| Album {
+                artist: String::new(),
+                album: name.into(),
+                tracks: vec![],
+            })
+            .to_vec();
+        press(&mut app, "/lamp\n");
+        assert_eq!(app.album_cursor, 0);
+        press(&mut app, "n");
+        assert_eq!(app.album_cursor, 2);
+        press(&mut app, "n");
+        assert_eq!(app.album_cursor, 0, "wraps");
+        press(&mut app, "N");
+        assert_eq!(app.album_cursor, 2);
         std::fs::remove_dir_all(&root).unwrap();
     }
 
