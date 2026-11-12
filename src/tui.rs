@@ -390,6 +390,25 @@ impl App {
     }
 
     fn open_tracks(&mut self, paths: &[PathBuf], title: String, select: Option<&Path>) {
+        let from = self.screen;
+        if let Some(o) = self.open.as_mut().filter(|o| {
+            o.tracks
+                .iter()
+                .map(|t| t.path.as_path())
+                .eq(paths.iter().map(PathBuf::as_path))
+        }) {
+            // Already open: go back to it, draft and all.
+            o.from = from;
+            let at = select.and_then(|s| o.tracks.iter().position(|t| t.path == s));
+            self.screen = Screen::Editor;
+            if let Some(i) = at {
+                let key = self.selected_key();
+                self.track = i + 1;
+                self.track_changed(key);
+            }
+            self.update_cover();
+            return;
+        }
         if !self.may_drop_draft("Enter") {
             return;
         }
@@ -1476,6 +1495,19 @@ mod tests {
         assert_eq!(info[0], "flac, mp3");
         assert_eq!(info[2], "320–900 kbps");
         assert_eq!(audio_info(&tracks[..1])[1], "16 bit · 44.1 kHz");
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn enter_on_the_open_album_keeps_the_draft() {
+        let root = library("reopen");
+        let mut app = App::new(root.clone(), Picker::halfblocks());
+        press(&mut app, "\njjjd\x1b"); // clear Genre, back to the albums
+        assert_eq!(app.screen, Screen::Albums);
+        press(&mut app, "\n");
+        assert_eq!(app.screen, Screen::Editor, "no unsaved-changes warning");
+        assert!(app.dirty());
+        assert_eq!(app.selected_key(), Some(ItemKey::Genre));
         std::fs::remove_dir_all(&root).unwrap();
     }
 
