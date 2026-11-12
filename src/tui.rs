@@ -28,9 +28,17 @@ use std::path::{Path, PathBuf};
 /// Cover box in cells; about square with the usual 1:2 cell shape.
 const COVER: Size = Size::new(20, 10);
 /// Fields that differ per track by nature: not edited for a whole album at once.
+/// Fields the "all" row hides: they only make sense track by track.
 const PER_TRACK: [ItemKey; 2] = [ItemKey::TrackNumber, ItemKey::TrackTitle];
-/// Index of the first `MORE` field in the field list (after Filename and `MAIN`).
-const FIRST_MORE: usize = 1 + MAIN.len();
+/// Standard fields never shown (kept on save like custom ones).
+const HIDDEN: [ItemKey; 6] = [
+    ItemKey::EncoderSoftware,
+    ItemKey::Isrc,
+    ItemKey::ReplayGainAlbumGain,
+    ItemKey::ReplayGainAlbumPeak,
+    ItemKey::ReplayGainTrackGain,
+    ItemKey::ReplayGainTrackPeak,
+];
 const VARIOUS: &str = "<various>";
 
 pub fn run(root: PathBuf) -> Result<()> {
@@ -123,7 +131,7 @@ impl App {
             tree: Tree::new(root),
             open: None,
             track: 0,
-            field: 1,
+            field: 0,
             focus_tracks: false,
             editing: None,
             search: None,
@@ -189,13 +197,8 @@ impl App {
         match key.code {
             KeyCode::Char('?') => self.show_help = !self.show_help,
             KeyCode::Char('s') if ctrl => self.save(),
-            KeyCode::Tab => {
-                self.screen = match self.screen {
-                    Screen::Albums => Screen::Folders,
-                    Screen::Folders if self.open.is_some() => Screen::Editor,
-                    _ => Screen::Albums,
-                }
-            }
+            KeyCode::Tab if self.screen == Screen::Albums => self.screen = Screen::Folders,
+            KeyCode::Tab if self.screen == Screen::Folders => self.screen = Screen::Albums,
             code => match self.screen {
                 Screen::Albums => self.albums_key(code),
                 Screen::Folders => self.folders_key(code),
@@ -382,9 +385,29 @@ impl App {
     }
 
     fn open_tracks(&mut self, paths: &[PathBuf], title: String, select: Option<&Path>) {
+        let from = self.screen;
+        if let Some(o) = self.open.as_mut().filter(|o| {
+            o.tracks
+                .iter()
+                .map(|t| t.path.as_path())
+                .eq(paths.iter().map(PathBuf::as_path))
+        }) {
+            // Already open: go back to it, draft and all.
+            o.from = from;
+            let at = select.and_then(|s| o.tracks.iter().position(|t| t.path == s));
+            self.screen = Screen::Editor;
+            if let Some(i) = at {
+                let key = self.selected_key();
+                self.track = i + 1;
+                self.track_changed(key);
+            }
+            self.update_cover();
+            return;
+        }
         if !self.may_drop_draft("Enter") {
             return;
         }
+        let key = self.selected_key();
         let mut tracks = Vec::new();
         let mut failed = 0;
         for path in paths {
@@ -400,7 +423,6 @@ impl App {
         self.track = select
             .and_then(|s| tracks.iter().position(|t| t.path == s))
             .map_or(0, |i| i + 1);
-        self.field = self.field.min(FIRST_MORE - 1);
         self.focus_tracks = false;
         self.status = match failed {
             0 => format!("{} tracks", tracks.len()),
@@ -412,7 +434,20 @@ impl App {
             from: self.screen,
         });
         self.screen = Screen::Editor;
+        // Keep a `MAIN` field selected, else start at the first one.
+        let in_main = |k: &Option<ItemKey>| *k == key && MAIN.iter().any(|(m, _)| Some(*m) == key);
+        let rows = self.rows();
+        self.field = rows
+            .iter()
+            .position(in_main)
+            .or_else(|| rows.iter().position(|k| *k == Some(MAIN[0].0)))
+            .expect("MAIN is always listed");
         self.update_cover();
+    }
+
+    /// The field rows of the current selection ("all" hides Filename and `PER_TRACK`).
+    fn rows(&self) -> Vec<Option<ItemKey>> {
+        field_rows(self.selection(), self.track == 0)
     }
 
     fn selection(&self) -> &[Track] {
@@ -434,17 +469,15 @@ impl App {
     }
 
     fn selected_key(&self) -> Option<ItemKey> {
-        field_rows(self.selection())
-            .get(self.field)
-            .copied()
-            .flatten()
+        self.rows().get(self.field).copied().flatten()
     }
 
     fn editor_key(&mut self, code: KeyCode) {
         let Some(tracks) = self.open.as_ref().map(|o| 1 + o.tracks.len()) else {
             return;
         };
-        let fields = field_rows(self.selection()).len();
+        let fields = self.rows().len();
+        let key = self.selected_key();
         match code {
             KeyCode::Esc => self.screen = self.open.as_ref().map_or(Screen::Albums, |o| o.from),
             KeyCode::Left | KeyCode::Char('h') => self.focus_tracks = true,
@@ -452,14 +485,18 @@ impl App {
             KeyCode::Enter if self.focus_tracks => self.focus_tracks = false,
             KeyCode::Up | KeyCode::Char('k') if self.focus_tracks => {
                 self.track = (self.track + tracks - 1) % tracks;
-                self.track_changed();
+                self.track_changed(key);
             }
             KeyCode::Down | KeyCode::Char('j') if self.focus_tracks => {
                 self.track = (self.track + 1) % tracks;
-                self.track_changed();
+                self.track_changed(key);
             }
             KeyCode::Up | KeyCode::Char('k') => self.field = (self.field + fields - 1) % fields,
             KeyCode::Down | KeyCode::Char('j') => self.field = (self.field + 1) % fields,
+            KeyCode::Tab => {
+                self.focus_tracks = false;
+                self.field = (self.field + 1) % fields;
+            }
             KeyCode::Enter => self.start_edit(),
             KeyCode::Char('d') => self.clear_field(),
             KeyCode::Char('c') => self.stage_cover(),
@@ -474,8 +511,13 @@ impl App {
         }
     }
 
-    fn track_changed(&mut self) {
-        self.field = self.field.min(field_rows(self.selection()).len() - 1);
+    /// Keep the field that was selected (`key`) when the new selection has it.
+    fn track_changed(&mut self, key: Option<ItemKey>) {
+        let rows = self.rows();
+        self.field = rows
+            .iter()
+            .position(|k| *k == key)
+            .unwrap_or(self.field.min(rows.len() - 1));
         self.update_cover();
     }
 
@@ -485,9 +527,6 @@ impl App {
         let Some(key) = self.selected_key() else {
             return Some("filenames are read-only".into());
         };
-        if self.track == 0 && sel.len() > 1 && PER_TRACK.contains(&key) {
-            return Some(format!("{} is edited track by track", tags::label(key)));
-        }
         // ponytail: multi-line values (lyrics) are read-only; open them in $EDITOR if needed.
         if sel.iter().any(|t| tags::get(&t.draft, key).contains('\n')) {
             return Some("multi-line values are read-only".into());
@@ -681,7 +720,7 @@ impl App {
                 ("n/N", "next"),
                 ("s", "sort"),
                 ("←→", "fold"),
-                ("tab", "editor"),
+                ("tab", "albums"),
                 ("q", "quit"),
             ],
             Screen::Editor => &[
@@ -864,11 +903,12 @@ impl App {
             f.render_widget(Image::new(protocol), area);
         }
 
-        let rows = field_rows(sel);
+        let rows = self.rows();
+        let more = first_more(&rows);
         let focus = !self.focus_tracks;
         let mut table_rows = Vec::new();
         for (i, key) in rows.iter().enumerate() {
-            if i == FIRST_MORE {
+            if i == more {
                 table_rows.push(TableRow::new(vec![Cell::from(Span::styled(
                     "── more ──",
                     Style::default().fg(Color::DarkGray),
@@ -890,7 +930,7 @@ impl App {
                 Cell::from(value),
             ]));
         }
-        let shown = self.field + usize::from(self.field >= FIRST_MORE);
+        let shown = self.field + usize::from(self.field >= more);
         let table = Table::new(table_rows, [Constraint::Length(16), Constraint::Min(10)]);
         let mut state = TableState::default().with_selected(focus.then_some(shown));
         f.render_stateful_widget(table, fields_area, &mut state);
@@ -950,21 +990,30 @@ fn find(entries: &[String], query: &str, from: usize, forward: bool) -> Option<u
 }
 
 /// The field list for a selection: Filename (`None`), `MAIN`, `MORE`, then every other
-/// standard field the selected tracks have, by label.
-fn field_rows(sel: &[Track]) -> Vec<Option<ItemKey>> {
+/// standard field the selected tracks have (but `HIDDEN`), by label. `all` (the "all" row) leaves out
+/// Filename and `PER_TRACK`.
+fn field_rows(sel: &[Track], all: bool) -> Vec<Option<ItemKey>> {
     let listed = |k: &ItemKey| MAIN.iter().chain(&MORE).any(|(m, _)| m == k);
     let mut extra: Vec<ItemKey> = sel
         .iter()
         .flat_map(|t| t.draft.keys().chain(t.saved.keys()))
         .copied()
-        .filter(|k| !listed(k))
+        .filter(|k| !listed(k) && !HIDDEN.contains(k))
         .collect();
     extra.sort_by_key(|k| tags::label(*k));
     extra.dedup();
     std::iter::once(None)
         .chain(MAIN.iter().chain(&MORE).map(|(k, _)| Some(*k)))
         .chain(extra.into_iter().map(Some))
+        .filter(|k| !all || k.is_some_and(|k| !PER_TRACK.contains(&k)))
         .collect()
+}
+
+/// Index of the first `MORE` field in `rows`.
+fn first_more(rows: &[Option<ItemKey>]) -> usize {
+    rows.iter()
+        .position(|k| *k == Some(MORE[0].0))
+        .expect("MORE is always listed")
 }
 
 /// The cover the selection shows (the new one if staged) and whether every selected
@@ -1273,13 +1322,13 @@ mod tests {
         press(&mut app, "\n"); // open the album, "all" selected, field Artist
         assert_eq!(app.screen, Screen::Editor);
         assert_eq!(app.selection().len(), 3);
-        assert!(screen_text(&app).contains("Album Artist"));
+        let text = screen_text(&app);
+        assert!(text.contains("Album Artist"));
+        for hidden in ["Filename", "Track number", "Title"] {
+            assert!(!text.contains(hidden), "{hidden} is per track");
+        }
 
-        press(&mut app, "jjj\n"); // Title: per track only
-        assert!(app.editing.is_none());
-        assert!(app.status.contains("track by track"));
-
-        press(&mut app, "jj\n\x08\x08\x08\x08Jazz\n"); // Genre: Rock -> Jazz
+        press(&mut app, "jjj\n\x08\x08\x08\x08Jazz\n"); // Genre: Rock -> Jazz
         assert!(app.dirty());
         assert!(screen_text(&app).contains("Jazz"));
 
@@ -1305,13 +1354,15 @@ mod tests {
         let mut app = App::new(root.clone(), Picker::halfblocks());
         press(&mut app, "\nhj\njjj\n\x08\x08\x08\x08Intro\n"); // track 1 title
         assert_eq!(app.selection().len(), 1);
-        press(&mut app, "hk"); // back to "all"
+        assert!(screen_text(&app).contains("Filename"));
+        press(&mut app, "kkkd"); // track 1 artist cleared
+        press(&mut app, "hk"); // back to "all", still on Artist
         assert_eq!(app.track, 0);
+        assert_eq!(app.selected_key(), Some(ItemKey::TrackArtist));
         assert!(screen_text(&app).contains(VARIOUS));
         // An untouched <various> field stays as it was.
         press(&mut app, "l");
         let before: Vec<_> = app.selection().iter().map(|t| t.draft.clone()).collect();
-        app.field = 4;
         app.editing = Some(Input {
             text: String::new(),
             cursor: 0,
@@ -1418,6 +1469,9 @@ mod tests {
         assert_eq!(app.screen, Screen::Folders);
         press(&mut app, "ljj\n"); // expand Album, go to its second file
         assert_eq!(app.screen, Screen::Editor);
+        let field = app.field;
+        app.key(KeyEvent::from(KeyCode::Tab)); // next field, still in the editor
+        assert_eq!((app.screen, app.field), (Screen::Editor, field + 1));
         assert_eq!(app.open.as_ref().unwrap().tracks.len(), 3);
         assert_eq!(app.selection()[0].path, root.join("Album/tiny.m4a"));
         press(&mut app, "\x1b");
@@ -1427,6 +1481,8 @@ mod tests {
             app.tree.selected().unwrap().path,
             root.join("Album/tiny.mp3")
         );
+        app.key(KeyEvent::from(KeyCode::Tab));
+        assert_eq!(app.screen, Screen::Albums);
         std::fs::remove_dir_all(&root).unwrap();
     }
 
@@ -1444,5 +1500,31 @@ mod tests {
         assert_eq!(info[2], "320–900 kbps");
         assert_eq!(audio_info(&tracks[..1])[1], "16 bit · 44.1 kHz");
         std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn enter_on_the_open_album_keeps_the_draft() {
+        let root = library("reopen");
+        let mut app = App::new(root.clone(), Picker::halfblocks());
+        press(&mut app, "\njjjd\x1b"); // clear Genre, back to the albums
+        assert_eq!(app.screen, Screen::Albums);
+        press(&mut app, "\n");
+        assert_eq!(app.screen, Screen::Editor, "no unsaved-changes warning");
+        assert!(app.dirty());
+        assert_eq!(app.selected_key(), Some(ItemKey::Genre));
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn hidden_fields_are_not_listed() {
+        let mut t = Track::load(&Path::new(FIXTURES).join("tiny.flac")).unwrap();
+        t.saved.insert(ItemKey::Isrc, "USX9P0000001".into());
+        t.draft
+            .insert(ItemKey::ReplayGainTrackGain, "-6.5 dB".into());
+        t.draft.insert(ItemKey::Label, "ECM".into());
+        let rows = field_rows(std::slice::from_ref(&t), false);
+        assert!(rows.contains(&Some(ItemKey::Label)));
+        assert!(!rows.contains(&Some(ItemKey::Isrc)));
+        assert!(!rows.contains(&Some(ItemKey::ReplayGainTrackGain)));
     }
 }
