@@ -1606,6 +1606,7 @@ mod tests {
         let album = |album: &str, artist: &str| Album {
             artist: artist.into(),
             album: album.into(),
+            year: String::new(),
             tracks: vec![],
         };
         app.albums = vec![album("Ato", "Lamp"), album("Timely!!", "Anri")];
