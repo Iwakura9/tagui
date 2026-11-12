@@ -5,7 +5,7 @@ use lofty::file::{FileType, TaggedFileExt};
 use lofty::probe::Probe;
 use lofty::tag::ItemKey;
 use std::cmp::Reverse;
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 /// Whether tagui lists this file (by extension, as lofty knows it).
@@ -151,6 +151,9 @@ pub struct Row {
     pub album: String,
     pub disc: u32,
     pub track: u32,
+    /// Every genre, and every artist and album artist, one name per entry.
+    pub genres: Vec<String>,
+    pub artists: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -177,6 +180,15 @@ pub fn row(path: &Path) -> Option<Row> {
             .and_then(|n| n.trim().parse().ok())
             .unwrap_or(0)
     };
+    // Repeated items and "A; B" both hold several names.
+    let names = |key| {
+        tag.into_iter()
+            .flat_map(move |t| t.get_strings(key))
+            .flat_map(|s| s.split(';'))
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(String::from)
+    };
     let artist = match text(ItemKey::AlbumArtist) {
         "" => text(ItemKey::TrackArtist),
         a => a,
@@ -187,7 +199,32 @@ pub fn row(path: &Path) -> Option<Row> {
         album: text(ItemKey::AlbumTitle).to_string(),
         disc: number(ItemKey::DiscNumber),
         track: number(ItemKey::TrackNumber),
+        genres: names(ItemKey::Genre).collect(),
+        artists: names(ItemKey::TrackArtist)
+            .chain(names(ItemKey::AlbumArtist))
+            .collect(),
     })
+}
+
+/// Distinct names ignoring case, most used first (then by name); each in its most used
+/// spelling.
+pub fn choices<'a>(names: impl IntoIterator<Item = &'a String>) -> Vec<String> {
+    let mut spellings: HashMap<&str, usize> = HashMap::new();
+    for n in names {
+        *spellings.entry(n).or_default() += 1;
+    }
+    // lowercase -> (total uses, best spelling and its uses)
+    let mut groups: HashMap<String, (usize, &str, usize)> = HashMap::new();
+    for (name, count) in spellings {
+        let g = groups.entry(name.to_lowercase()).or_insert((0, name, 0));
+        g.0 += count;
+        if (count, Reverse(name)) > (g.2, Reverse(g.1)) {
+            (g.1, g.2) = (name, count);
+        }
+    }
+    let mut out: Vec<_> = groups.into_values().map(|(n, name, _)| (n, name)).collect();
+    out.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(b.1)));
+    out.into_iter().map(|(_, name)| name.to_string()).collect()
 }
 
 /// Every audio file under `root`, recursively.
@@ -323,6 +360,8 @@ mod tests {
             album: album.into(),
             disc,
             track,
+            genres: vec![],
+            artists: vec![],
         };
         let rows = [
             r("z/2", "Lamp", "Dusk to Dawn", 1, 2),
@@ -382,5 +421,13 @@ mod tests {
             (r.artist.as_str(), r.album.as_str(), r.track),
             ("Album Artist", "Album", 3)
         );
+        assert_eq!(r.genres, ["Rock"]);
+        assert_eq!(r.artists, ["Artist", "Album Artist"]);
+    }
+
+    #[test]
+    fn choices_merge_case_most_used_first() {
+        let names = ["rock", "Jazz", "Rock", "Rock", "Ambient", "jazz"].map(String::from);
+        assert_eq!(choices(&names), ["Rock", "Jazz", "Ambient"]);
     }
 }

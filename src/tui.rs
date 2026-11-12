@@ -17,7 +17,8 @@ use ratatui::layout::{Constraint, Flex, Layout, Rect, Size};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
-    Block, Borders, Cell, List, ListItem, ListState, Paragraph, Row as TableRow, Table, TableState,
+    Block, Borders, Cell, Clear, List, ListItem, ListState, Paragraph, Row as TableRow, Table,
+    TableState,
 };
 use ratatui_image::picker::Picker;
 use ratatui_image::protocol::Protocol;
@@ -66,10 +67,39 @@ struct Open {
     from: Screen,
 }
 
-/// Text being typed into a field, with the cursor as a char index.
+/// Text being typed into a field, with the cursor as a char index. A field with
+/// `choices` is a picker: the text filters them and `pick` is the highlighted match.
+/// A `free` picker also offers the text itself when no choice is exactly that.
+#[derive(Default)]
 struct Input {
     text: String,
     cursor: usize,
+    choices: Vec<String>,
+    pick: usize,
+    free: bool,
+}
+
+impl Input {
+    /// The choices that contain the text, ignoring case, then the text if it is new.
+    // ponytail: plain lowercase match like `find`; fold accents if that bites.
+    fn matches(&self) -> Vec<&str> {
+        let query = self.text.to_lowercase();
+        let mut out: Vec<&str> = self
+            .choices
+            .iter()
+            .filter(|c| c.to_lowercase().contains(&query))
+            .map(String::as_str)
+            .collect();
+        if self.free && !self.is_choice(&self.text) && !self.text.trim().is_empty() {
+            out.push(&self.text);
+        }
+        out
+    }
+
+    fn is_choice(&self, text: &str) -> bool {
+        let text = text.to_lowercase();
+        self.choices.iter().any(|c| c.to_lowercase() == text)
+    }
 }
 
 /// A `/` search being typed in a list; Esc puts the cursor back at `origin`.
@@ -544,10 +574,33 @@ impl App {
             .and_then(|k| tags::common(self.selection(), k))
             .unwrap_or("")
             .to_string();
+        let choices = key.map_or(vec![], |k| self.choices(k));
+        if choices.is_empty() {
+            self.editing = Some(Input {
+                cursor: text.chars().count(),
+                text,
+                ..Input::default()
+            });
+            return;
+        }
+        // A picker starts empty, on the current value.
         self.editing = Some(Input {
-            cursor: text.chars().count(),
-            text,
+            pick: choices.iter().position(|c| *c == text).unwrap_or(0),
+            choices,
+            free: key != Some(ItemKey::Genre),
+            ..Input::default()
         });
+    }
+
+    /// What a picker field offers: the values the library already has.
+    fn choices(&self, key: ItemKey) -> Vec<String> {
+        match key {
+            ItemKey::Genre => library::choices(self.rows.iter().flat_map(|r| &r.genres)),
+            ItemKey::TrackArtist | ItemKey::AlbumArtist => {
+                library::choices(self.rows.iter().flat_map(|r| &r.artists))
+            }
+            _ => vec![],
+        }
     }
 
     fn input_key(&mut self, code: KeyCode) {
@@ -556,9 +609,18 @@ impl App {
         };
         let len = input.text.chars().count();
         let byte = |text: &str, at: usize| text.char_indices().nth(at).map_or(text.len(), |c| c.0);
+        let picker = !input.choices.is_empty();
         match code {
             KeyCode::Esc => return,
+            KeyCode::Enter if picker => match input.matches().get(input.pick) {
+                Some(choice) => return self.commit(choice.to_string()),
+                None => self.status = "not in the library: pick one from the list".into(),
+            },
             KeyCode::Enter => return self.commit(input.text),
+            KeyCode::Up if picker => input.pick = input.pick.saturating_sub(1),
+            KeyCode::Down if picker => {
+                input.pick = (input.pick + 1).min(input.matches().len().saturating_sub(1));
+            }
             KeyCode::Backspace if input.cursor > 0 => {
                 input.cursor -= 1;
                 input.text.remove(byte(&input.text, input.cursor));
@@ -575,6 +637,14 @@ impl App {
                 input.cursor += 1;
             }
             _ => {}
+        }
+        if picker
+            && matches!(
+                code,
+                KeyCode::Char(_) | KeyCode::Backspace | KeyCode::Delete
+            )
+        {
+            input.pick = 0;
         }
         self.editing = Some(input);
     }
@@ -934,6 +1004,49 @@ impl App {
         let table = Table::new(table_rows, [Constraint::Length(16), Constraint::Min(10)]);
         let mut state = TableState::default().with_selected(focus.then_some(shown));
         f.render_stateful_widget(table, fields_area, &mut state);
+
+        // A picker's matches drop down under the field (or rise above it).
+        let Some(input) = self.editing.as_ref().filter(|i| !i.choices.is_empty()) else {
+            return;
+        };
+        let matches = input.matches();
+        let row = fields_area.y + (shown - state.offset()) as u16;
+        let below = fields_area.bottom().saturating_sub(row + 1);
+        let above = row.saturating_sub(fields_area.y);
+        let height = (matches.len().max(1) as u16 + 2)
+            .min(12)
+            .min(below.max(above));
+        let y = if height <= below {
+            row + 1
+        } else {
+            row - height
+        };
+        let x = fields_area.x + 17;
+        let area = Rect::new(x, y, 40.min(fields_area.right().saturating_sub(x)), height);
+        let items: Vec<ListItem> = if matches.is_empty() {
+            vec![ListItem::new(Span::styled(
+                "no match",
+                Style::default().fg(Color::DarkGray),
+            ))]
+        } else {
+            matches
+                .iter()
+                .map(|m| match input.is_choice(m) {
+                    true => ListItem::new(m.to_string()),
+                    false => ListItem::new(Line::from(vec![
+                        Span::raw(m.to_string()),
+                        Span::styled("  (new)", Style::default().fg(Color::DarkGray)),
+                    ])),
+                })
+                .collect()
+        };
+        let list = List::new(items)
+            .block(Block::default().borders(Borders::ALL))
+            .highlight_style(Style::default().fg(Color::Black).bg(Color::Yellow));
+        let mut pick =
+            ListState::default().with_selected((!matches.is_empty()).then_some(input.pick));
+        f.render_widget(Clear, area);
+        f.render_stateful_widget(list, area, &mut pick);
     }
 
     /// A field's value for the selection: shared value, or <various>; green when edited.
@@ -1328,9 +1441,9 @@ mod tests {
             assert!(!text.contains(hidden), "{hidden} is per track");
         }
 
-        press(&mut app, "jjj\n\x08\x08\x08\x08Jazz\n"); // Genre: Rock -> Jazz
+        press(&mut app, "jj\n\x08\x08\x08\x08\x08Live\n"); // Album: Album -> Live
         assert!(app.dirty());
-        assert!(screen_text(&app).contains("Jazz"));
+        assert!(screen_text(&app).contains("Live"));
 
         press(&mut app, "c"); // folder cover differs from the embedded one
         assert!(app.selection().iter().all(|t| t.new_cover.is_some()));
@@ -1341,7 +1454,7 @@ mod tests {
         let cover = std::fs::read(root.join("Album/cover.jpg")).unwrap();
         for f in ["tiny.flac", "tiny.mp3", "tiny.m4a"] {
             let t = Track::load(&root.join("Album").join(f)).unwrap();
-            assert_eq!(tags::get(&t.saved, ItemKey::Genre), "Jazz", "{f}");
+            assert_eq!(tags::get(&t.saved, ItemKey::AlbumTitle), "Live", "{f}");
             assert_eq!(t.cover.as_ref(), Some(&cover), "{f}");
         }
         assert!(press(&mut app, "q"), "nothing unsaved: q quits");
@@ -1363,10 +1476,7 @@ mod tests {
         // An untouched <various> field stays as it was.
         press(&mut app, "l");
         let before: Vec<_> = app.selection().iter().map(|t| t.draft.clone()).collect();
-        app.editing = Some(Input {
-            text: String::new(),
-            cursor: 0,
-        });
+        app.editing = Some(Input::default());
         press(&mut app, "\n");
         let after: Vec<_> = app.selection().iter().map(|t| t.draft.clone()).collect();
         assert_eq!(before, after);
@@ -1512,6 +1622,63 @@ mod tests {
         assert_eq!(app.screen, Screen::Editor, "no unsaved-changes warning");
         assert!(app.dirty());
         assert_eq!(app.selected_key(), Some(ItemKey::Genre));
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn genre_picks_from_the_library() {
+        let root = library("genre");
+        let mut app = App::new(root.clone(), Picker::halfblocks());
+        app.rows[0].genres = vec!["Jazz".into()];
+        press(&mut app, "\njjj\n"); // Genre opens the picker, on the current value
+        let input = app.editing.as_ref().unwrap();
+        assert_eq!(input.choices, ["Rock", "Jazz"]);
+        assert_eq!(input.pick, 0);
+        assert!(screen_text(&app).contains("│Jazz"));
+
+        press(&mut app, "x\n"); // no invented genres
+        assert!(app.editing.is_some());
+        assert!(app.status.contains("not in the library"));
+
+        press(&mut app, "\x08JA\n");
+        assert!(app.editing.is_none());
+        assert!(app
+            .selection()
+            .iter()
+            .all(|t| tags::get(&t.draft, ItemKey::Genre) == "Jazz"));
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn artist_picks_from_the_library_or_takes_a_new_name() {
+        let root = library("artist");
+        let mut app = App::new(root.clone(), Picker::halfblocks());
+        press(&mut app, "\n\n"); // Artist: track and album artists, on the current one
+        let input = app.editing.as_ref().unwrap();
+        assert_eq!(input.choices, ["Album Artist", "Artist"]);
+        assert_eq!(input.pick, 1);
+
+        press(&mut app, "Lamp");
+        assert!(screen_text(&app).contains("Lamp  (new)"));
+        press(&mut app, "\n");
+        assert_eq!(app.selected_key(), Some(ItemKey::TrackArtist));
+        assert_eq!(
+            tags::common(app.selection(), ItemKey::TrackArtist),
+            Some("Lamp")
+        );
+
+        app.key(KeyEvent::from(KeyCode::Tab)); // Album artist
+        press(&mut app, "\nart");
+        assert_eq!(
+            app.editing.as_ref().unwrap().matches(),
+            ["Album Artist", "Artist", "art"]
+        );
+        app.key(KeyEvent::from(KeyCode::Down));
+        press(&mut app, "\n");
+        assert_eq!(
+            tags::common(app.selection(), ItemKey::AlbumArtist),
+            Some("Artist")
+        );
         std::fs::remove_dir_all(&root).unwrap();
     }
 
