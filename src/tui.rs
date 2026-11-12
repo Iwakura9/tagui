@@ -36,7 +36,7 @@ const COVER: Size = Size::new(20, 10);
 /// Thumbnail of each album in the rows view, in cells.
 const THUMB: Size = Size::new(6, 3);
 /// Cover of each album in the grid view, in cells; two lines of text go under it.
-const GRID: Size = Size::new(20, 10);
+const GRID: Size = Size::new(18, 9);
 /// Fields that differ per track by nature: not edited for a whole album at once.
 /// Fields the "all" row hides: they only make sense track by track.
 const PER_TRACK: [ItemKey; 2] = [ItemKey::TrackNumber, ItemKey::TrackTitle];
@@ -1949,7 +1949,7 @@ mod tests {
         app.albums = (0..7).map(|i| album(format!("A{i}"))).collect();
         press(&mut app, "vv");
         assert!(screen_text(&mut app).contains("· grid "));
-        assert_eq!(app.tile_cols, 4); // 98 cells inside the border, 22 per tile
+        assert_eq!(app.tile_cols, 4); // 98 cells inside the border, 20 per tile
         press(&mut app, "j");
         assert_eq!(app.album_cursor, 4);
         press(&mut app, "llj");
