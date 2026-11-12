@@ -5,7 +5,7 @@
 //! untouched, so tagui never shows them and never loses them.
 
 use anyhow::{bail, Context, Result};
-use lofty::config::WriteOptions;
+use lofty::config::{ParseOptions, WriteOptions};
 use lofty::file::{AudioFile, TaggedFileExt};
 use lofty::ogg::tag::VorbisComments;
 use lofty::picture::{Picture, PictureType};
@@ -233,6 +233,14 @@ impl Track {
 
 /// The front cover, else the first picture: MP4 pictures have no type (lofty reads
 /// them all as `Other`).
+/// The embedded cover of `path` (front, else first picture), reading nothing else.
+pub fn cover(path: &Path) -> Option<Vec<u8>> {
+    let options = ParseOptions::new().read_properties(false);
+    let file = Probe::open(path).ok()?.options(options).read().ok()?;
+    let tag = file.primary_tag()?;
+    Some(tag.pictures()[cover_index(tag)?].data().to_vec())
+}
+
 fn cover_index(tag: &Tag) -> Option<usize> {
     let pictures = tag.pictures();
     let front = pictures
@@ -401,6 +409,15 @@ mod tests {
         assert_eq!(common(&tracks, ItemKey::Composer), Some(""));
         assert_eq!(common(&[], ItemKey::Genre), None);
         std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn cover_reads_the_embedded_picture() {
+        let path = Path::new(FIXTURES).join("tiny.flac");
+        let loaded = Track::load(&path).unwrap().cover;
+        assert!(loaded.is_some());
+        assert_eq!(cover(&path), loaded);
+        assert_eq!(cover(&Path::new(FIXTURES).join("other.jpg")), None);
     }
 
     #[test]

@@ -2,6 +2,7 @@
 //! a whole album or folder (track list on the left, fields and cover on the right).
 //! Edits stay in each track's draft; files change only on Ctrl+s.
 
+use crate::config;
 use crate::library::{self, Album, Row, Tree};
 use crate::tags::{self, Track, MAIN, MORE, NUMERIC};
 use anyhow::Result;
@@ -22,13 +23,23 @@ use ratatui::widgets::{
 };
 use ratatui_image::picker::Picker;
 use ratatui_image::protocol::Protocol;
+use ratatui_image::sliced::{SignedPosition, SlicedImage, SlicedProtocol};
 use ratatui_image::{Image, Resize};
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::io::{stdout, Stdout};
 use std::path::{Path, PathBuf};
+use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 /// Cover box in cells; about square with the usual 1:2 cell shape.
 const COVER: Size = Size::new(20, 10);
+/// Thumbnail of each album in the rows view, in cells.
+const THUMB: Size = Size::new(6, 3);
+/// Cover sizes of the grid view, in cells; two lines of text go under each cover.
+const GRID: [Size; 3] = [Size::new(16, 8), Size::new(18, 9), Size::new(20, 10)];
+/// Columns between grid covers, at least.
+const GRID_GAP: u16 = 2;
 /// Fields that differ per track by nature: not edited for a whole album at once.
 /// Fields the "all" row hides: they only make sense track by track.
 const PER_TRACK: [ItemKey; 2] = [ItemKey::TrackNumber, ItemKey::TrackTitle];
@@ -50,7 +61,10 @@ pub fn run(root: PathBuf) -> Result<()> {
     let mut terminal = ratatui::Terminal::new(CrosstermBackend::new(stdout()))?;
     let scanning = format!("scanning {}…", root.display());
     terminal.draw(|f| f.render_widget(Paragraph::new(scanning.as_str()), f.area()))?;
-    App::new(root, picker).event_loop(&mut terminal)
+    let mut app = App::new(root, picker);
+    app.apply(&config::load());
+    app.event_loop(&mut terminal)?;
+    config::save(&app.settings())
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -58,6 +72,34 @@ enum Screen {
     Albums,
     Folders,
     Editor,
+}
+
+/// How Albums shows the albums (`v` cycles).
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum AlbumView {
+    Compact,
+    Rows,
+    Grid,
+}
+
+impl AlbumView {
+    fn name(self) -> &'static str {
+        match self {
+            AlbumView::Compact => "compact",
+            AlbumView::Rows => "rows",
+            AlbumView::Grid => "grid",
+        }
+    }
+
+    const ALL: [AlbumView; 3] = [AlbumView::Compact, AlbumView::Rows, AlbumView::Grid];
+
+    fn next(self) -> Self {
+        match self {
+            AlbumView::Compact => AlbumView::Rows,
+            AlbumView::Rows => AlbumView::Grid,
+            AlbumView::Grid => AlbumView::Compact,
+        }
+    }
 }
 
 /// The album or folder in the editor.
@@ -123,6 +165,45 @@ struct Cover {
     protocol: Option<Protocol>,
 }
 
+/// An album cover at a size: the album's first track and the size in cells.
+type ThumbKey = (PathBuf, Size);
+
+/// Workers that decode album covers off the UI thread (decoding a 1400 px JPEG takes
+/// ~12 ms): keys in, protocols out. They stop when the job sender is dropped.
+// ponytail: FIFO, so a fast scroll decodes every album it passes; drop stale jobs if it lags.
+fn thumb_workers(
+    picker: &Picker,
+) -> (
+    Sender<ThumbKey>,
+    Receiver<(ThumbKey, Option<SlicedProtocol>)>,
+) {
+    let (jobs, queue) = mpsc::channel::<ThumbKey>();
+    let (done, results) = mpsc::channel();
+    let queue = Arc::new(Mutex::new(queue));
+    let workers = std::thread::available_parallelism().map_or(2, |n| n.get().min(4));
+    for _ in 0..workers {
+        let (queue, done, picker) = (queue.clone(), done.clone(), picker.clone());
+        std::thread::spawn(move || loop {
+            let Ok(key) = queue
+                .lock()
+                .map_err(drop)
+                .and_then(|q| q.recv().map_err(drop))
+            else {
+                return;
+            };
+            let thumb = tags::cover(&key.0).and_then(|bytes| {
+                let img = image::load_from_memory(&bytes).ok()?;
+                let fit = Resize::Fit(Some(FilterType::Triangle));
+                SlicedProtocol::new_with_resize(&picker, img, key.1, fit).ok()
+            });
+            if done.send((key, thumb)).is_err() {
+                return;
+            }
+        });
+    }
+    (jobs, results)
+}
+
 struct App {
     screen: Screen,
     rows: Vec<Row>,
@@ -130,6 +211,18 @@ struct App {
     album_cursor: usize,
     /// Albums ordered by artist, else by album.
     albums_by_artist: bool,
+    album_view: AlbumView,
+    /// Terminal lines scrolled past in the views that scroll themselves (rows, grid).
+    album_scroll: usize,
+    /// Albums per line and per screen at the last draw, for the keys that move by them.
+    tile_cols: usize,
+    tile_page: usize,
+    /// Album covers by first track and size; None while loading or when there is none.
+    thumbs: HashMap<ThumbKey, Option<SlicedProtocol>>,
+    /// Covers asked from the workers (`thumb_workers`) and not back yet.
+    thumb_jobs: Sender<ThumbKey>,
+    thumb_done: Receiver<(ThumbKey, Option<SlicedProtocol>)>,
+    loading: usize,
     tree: Tree,
     open: Option<Open>,
     /// 0 = all tracks, 1.. = `tracks[track - 1]`.
@@ -158,12 +251,21 @@ impl App {
             rows.len(),
             albums.len()
         );
+        let (thumb_jobs, thumb_done) = thumb_workers(&picker);
         Self {
             screen: Screen::Albums,
             rows,
             albums,
             album_cursor: 0,
             albums_by_artist: false,
+            album_view: AlbumView::Compact,
+            album_scroll: 0,
+            tile_cols: 1,
+            tile_page: 10,
+            thumbs: HashMap::new(),
+            thumb_jobs,
+            thumb_done,
+            loading: 0,
             tree: Tree::new(root),
             open: None,
             track: 0,
@@ -180,12 +282,60 @@ impl App {
         }
     }
 
+    /// What `config` keeps between runs: the album view, both orders and the screen.
+    fn settings(&self) -> Vec<(&'static str, &'static str)> {
+        let screen = match self.open.as_ref().filter(|_| self.screen == Screen::Editor) {
+            Some(o) => o.from,
+            None => self.screen,
+        };
+        vec![
+            ("view", self.album_view.name()),
+            ("albums", self.album_order()),
+            ("folders", self.folder_order()),
+            (
+                "screen",
+                if screen == Screen::Folders {
+                    "folders"
+                } else {
+                    "albums"
+                },
+            ),
+        ]
+    }
+
+    /// Restore `settings`; unknown keys and values are left at their default.
+    fn apply(&mut self, settings: &HashMap<String, String>) {
+        let get = |key: &str| settings.get(key).map(String::as_str);
+        if let Some(v) = AlbumView::ALL
+            .into_iter()
+            .find(|v| get("view") == Some(v.name()))
+        {
+            self.album_view = v;
+        }
+        if get("albums") == Some("artist") {
+            self.albums_by_artist = true;
+            library::sort_albums(&mut self.albums, true);
+        }
+        if get("folders") == Some("date") && !self.tree.by_date {
+            self.tree.toggle_order();
+        }
+        if get("screen") == Some("folders") {
+            self.screen = Screen::Folders;
+        }
+    }
+
     fn event_loop(
         &mut self,
         terminal: &mut ratatui::Terminal<CrosstermBackend<Stdout>>,
     ) -> Result<()> {
-        loop {
+        'draw: loop {
             terminal.draw(|f| self.draw(f))?;
+            // While covers are loading, wake up to show them as they come.
+            while self.loading > 0 && !event::poll(Duration::from_millis(30))? {
+                if self.receive_thumbs() {
+                    continue 'draw;
+                }
+            }
             let Event::Key(key) = event::read()? else {
                 continue;
             };
@@ -245,15 +395,29 @@ impl App {
 
     fn albums_key(&mut self, code: KeyCode) {
         let last = self.albums.len().saturating_sub(1);
+        let (line, page) = match self.album_view {
+            AlbumView::Compact => (1, 10),
+            _ => (self.tile_cols, self.tile_page),
+        };
         let c = &mut self.album_cursor;
         match code {
-            KeyCode::Up | KeyCode::Char('k') => *c = c.saturating_sub(1),
-            KeyCode::Down | KeyCode::Char('j') => *c = (*c + 1).min(last),
-            KeyCode::PageUp => *c = c.saturating_sub(10),
-            KeyCode::PageDown => *c = (*c + 10).min(last),
+            KeyCode::Up | KeyCode::Char('k') => *c = c.saturating_sub(line),
+            KeyCode::Down | KeyCode::Char('j') => *c = (*c + line).min(last),
+            KeyCode::PageUp => *c = c.saturating_sub(page),
+            KeyCode::PageDown => *c = (*c + page).min(last),
+            KeyCode::Left | KeyCode::Char('h') if self.album_view == AlbumView::Grid => {
+                *c = c.saturating_sub(1)
+            }
+            KeyCode::Right | KeyCode::Char('l') if self.album_view == AlbumView::Grid => {
+                *c = (*c + 1).min(last)
+            }
             KeyCode::Home => *c = 0,
             KeyCode::End => *c = last,
             KeyCode::Char('/') => self.start_search(),
+            KeyCode::Char('v') => {
+                self.album_view = self.album_view.next();
+                self.status = format!("albums: {} view", self.album_view.name());
+            }
             KeyCode::Char('s') => {
                 let keep = self.albums.get(self.album_cursor).cloned();
                 self.albums_by_artist = !self.albums_by_artist;
@@ -764,6 +928,7 @@ impl App {
         }
         self.albums = library::albums(&self.rows);
         library::sort_albums(&mut self.albums, self.albums_by_artist);
+        self.thumbs.clear();
         if let Some(i) = self.albums.iter().position(|a| a.tracks.contains(&first)) {
             self.album_cursor = i;
         }
@@ -793,13 +958,14 @@ impl App {
         });
     }
 
-    fn draw(&self, f: &mut ratatui::Frame) {
+    fn draw(&mut self, f: &mut ratatui::Frame) {
         let [main, status] =
             Layout::vertical([Constraint::Min(5), Constraint::Length(1)]).areas(f.area());
         match (self.screen, &self.open) {
             (Screen::Editor, Some(o)) => self.draw_editor(f, o, main),
             (Screen::Folders, _) => self.draw_tree(f, main),
-            _ => self.draw_albums(f, main),
+            _ if self.album_view == AlbumView::Compact => self.draw_albums(f, main),
+            _ => self.draw_album_tiles(f, main),
         }
         if let Some(search) = &self.search {
             self.draw_search(f, search, main);
@@ -813,6 +979,7 @@ impl App {
                 ("⏎", "open"),
                 ("/", "search"),
                 ("s", "sort"),
+                ("v", "view"),
                 ("tab", "folders"),
                 ("q", "quit"),
             ],
@@ -945,16 +1112,160 @@ impl App {
                 ]))
             })
             .collect();
-        let title = format!(
-            " albums · {} · by {} ",
-            self.tree.root.display(),
-            self.album_order()
-        );
         let list = List::new(items)
-            .block(Block::default().borders(Borders::ALL).title(title))
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(self.albums_title()),
+            )
             .highlight_style(Style::default().add_modifier(Modifier::REVERSED));
         let mut state = ListState::default().with_selected(Some(self.album_cursor));
         f.render_stateful_widget(list, area, &mut state);
+    }
+
+    fn albums_title(&self) -> String {
+        format!(
+            " albums · {} · by {} · {} ",
+            self.tree.root.display(),
+            self.album_order(),
+            self.album_view.name()
+        )
+    }
+
+    /// The albums as tiles with their cover: one per line in the rows view, as many as fit
+    /// the width in the grid.
+    fn draw_album_tiles(&mut self, f: &mut ratatui::Frame, area: Rect) {
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .title(self.albums_title());
+        let inner = block.inner(area);
+        f.render_widget(block, area);
+        let grid = self.album_view == AlbumView::Grid;
+        let (thumb, cell) = if grid {
+            let size = grid_size(inner.width);
+            (size, Size::new(size.width + GRID_GAP, size.height + 3))
+        } else {
+            (THUMB, Size::new(inner.width, THUMB.height))
+        };
+        let cols = ((inner.width + GRID_GAP) / cell.width.max(1)).max(1) as usize;
+        // What the columns leave unused goes evenly around them.
+        let width = if grid { thumb.width } else { inner.width };
+        let columns = Layout::horizontal(vec![Constraint::Length(width); cols])
+            .flex(Flex::SpaceEvenly)
+            .split(inner);
+        // The view scrolls by terminal line: rows cut at the top or bottom show in part.
+        let (cell_h, height) = (cell.height as usize, inner.height as usize);
+        let rows_on_screen = (height / cell_h).max(1);
+        (self.tile_cols, self.tile_page) = (cols, cols * rows_on_screen);
+        let cursor_y = self.album_cursor / cols * cell_h;
+        let content = self.albums.len().div_ceil(cols) * cell_h;
+        self.album_scroll = self
+            .album_scroll
+            .min(content.saturating_sub(height))
+            .max((cursor_y + cell_h).saturating_sub(height))
+            .min(cursor_y);
+
+        let open: Option<PathBuf> = self.open.as_ref().map(|o| o.tracks[0].path.clone());
+        let first_row = self.album_scroll / cell_h;
+        let last_row = (self.album_scroll + height).div_ceil(cell_h);
+        let (text_dy, text_dx, text_h) = if grid {
+            (thumb.height, 0, 2)
+        } else {
+            (0, thumb.width + 1, THUMB.height)
+        };
+        for i in (first_row * cols..self.albums.len()).take((last_row - first_row) * cols) {
+            let column = columns[i % cols];
+            // Top of the tile in the view; negative when it is cut at the top.
+            let top = (i / cols * cell_h) as i32 - self.album_scroll as i32;
+            // One view line `dy` lines down the tile, from `dx` to the column's end.
+            let line_at = |dy: u16, dx: u16| {
+                let y = top + i32::from(dy);
+                let line = Rect::new(column.x + dx, inner.y + y.max(0) as u16, column.width, 1);
+                (0..inner.height as i32)
+                    .contains(&y)
+                    .then(|| line.intersection(column).intersection(inner))
+            };
+            let a = &self.albums[i];
+            let mark = if open.as_ref().is_some_and(|p| a.tracks.contains(p)) {
+                " ●"
+            } else {
+                ""
+            };
+            let mut lines = vec![
+                Line::from(vec![
+                    Span::styled(
+                        or_none(&a.album, "(no album)").to_string(),
+                        Style::default().add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(mark, Style::default().fg(Color::Green)),
+                ]),
+                Line::from(Span::styled(
+                    if grid {
+                        or_none(&a.artist, "(no artist)").to_string()
+                    } else {
+                        album_meta(a)
+                    },
+                    Style::default().fg(Color::Cyan),
+                )),
+            ];
+            lines.resize(text_h.into(), Line::default());
+            let style = if i == self.album_cursor {
+                Style::default().add_modifier(Modifier::REVERSED)
+            } else {
+                Style::default()
+            };
+            for (dy, line) in (text_dy..).zip(lines) {
+                if let Some(area) = line_at(dy, text_dx) {
+                    f.render_widget(Paragraph::new(line).style(style), area);
+                }
+            }
+            let strip = Rect::new(column.x, inner.y, thumb.width, inner.height).intersection(inner);
+            match self.thumb(i, thumb) {
+                Some(p) => {
+                    let at = SignedPosition {
+                        x: 0,
+                        y: top as i16,
+                    };
+                    f.render_widget(SlicedImage::new(p, at), strip);
+                }
+                None => {
+                    if let Some(area) = line_at(thumb.height / 2, 0) {
+                        let area = Rect {
+                            width: thumb.width,
+                            ..area
+                        }
+                        .intersection(area);
+                        let placeholder = Paragraph::new("♪")
+                            .centered()
+                            .style(Style::default().fg(Color::DarkGray));
+                        f.render_widget(placeholder, area);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Album `i`'s cover fit to `size`; asks the workers for it on first use.
+    fn thumb(&mut self, i: usize, size: Size) -> Option<&SlicedProtocol> {
+        let key = (self.albums.get(i)?.tracks.first()?.clone(), size);
+        if !self.thumbs.contains_key(&key) {
+            self.thumbs.insert(key.clone(), None);
+            if self.thumb_jobs.send(key.clone()).is_ok() {
+                self.loading += 1;
+            }
+        }
+        self.thumbs[&key].as_ref()
+    }
+
+    /// Take the covers the workers finished; true when any arrived.
+    fn receive_thumbs(&mut self) -> bool {
+        let mut any = false;
+        while let Ok((key, thumb)) = self.thumb_done.try_recv() {
+            self.loading -= 1;
+            self.thumbs.insert(key, thumb);
+            any = true;
+        }
+        any
     }
 
     fn draw_tree(&self, f: &mut ratatui::Frame, area: Rect) {
@@ -1282,6 +1593,24 @@ fn album_title(a: &Album) -> String {
     )
 }
 
+/// "Artist · 2004 · 12 tracks", without the parts that are missing.
+fn album_meta(a: &Album) -> String {
+    let n = a.tracks.len();
+    let tracks = format!("{n} track{}", if n == 1 { "" } else { "s" });
+    [or_none(&a.artist, "(no artist)"), &a.year, &tracks]
+        .iter()
+        .filter(|s| !s.is_empty())
+        .copied()
+        .collect::<Vec<_>>()
+        .join(" · ")
+}
+
+/// The grid cover size that leaves the least of `width` unused; the biggest on a tie.
+fn grid_size(width: u16) -> Size {
+    let unused = |s: &Size| (width + GRID_GAP) % (s.width + GRID_GAP);
+    GRID.into_iter().rev().min_by_key(unused).unwrap_or(GRID[0])
+}
+
 fn or_none<'a>(s: &'a str, none: &'a str) -> &'a str {
     if s.is_empty() {
         none
@@ -1485,6 +1814,7 @@ mod tests {
         for c in keys.chars() {
             let code = match c {
                 '\n' => KeyCode::Enter,
+                '\t' => KeyCode::Tab,
                 '\x08' => KeyCode::Backspace,
                 '\x1b' => KeyCode::Esc,
                 c => KeyCode::Char(c),
@@ -1498,7 +1828,7 @@ mod tests {
         app.key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL));
     }
 
-    fn screen_text(app: &App) -> String {
+    fn screen_text(app: &mut App) -> String {
         let mut terminal = ratatui::Terminal::new(TestBackend::new(100, 30)).unwrap();
         terminal.draw(|f| app.draw(f)).unwrap();
         let buffer = terminal.backend().buffer();
@@ -1519,7 +1849,7 @@ mod tests {
         press(&mut app, "\n"); // open the album, "all" selected, field Artist
         assert_eq!(app.screen, Screen::Editor);
         assert_eq!(app.selection().len(), 3);
-        let text = screen_text(&app);
+        let text = screen_text(&mut app);
         assert!(text.contains("Album Artist"));
         for hidden in ["Filename", "Track number", "Title"] {
             assert!(!text.contains(hidden), "{hidden} is per track");
@@ -1527,7 +1857,7 @@ mod tests {
 
         press(&mut app, "jj\n\x08\x08\x08\x08\x08Live\n"); // Album: Album -> Live
         assert!(app.dirty());
-        assert!(screen_text(&app).contains("Live"));
+        assert!(screen_text(&mut app).contains("Live"));
 
         press(&mut app, "c"); // folder cover differs from the embedded one
         assert!(app.selection().iter().all(|t| t.new_cover.is_some()));
@@ -1551,12 +1881,12 @@ mod tests {
         let mut app = App::new(root.clone(), Picker::halfblocks());
         press(&mut app, "\nhj\njjj\n\x08\x08\x08\x08Intro\n"); // track 1 title
         assert_eq!(app.selection().len(), 1);
-        assert!(screen_text(&app).contains("Filename"));
+        assert!(screen_text(&mut app).contains("Filename"));
         press(&mut app, "kkkd"); // track 1 artist cleared
-        press(&mut app, "hk"); // back to "all", still on Artist
+        press(&mut app, "hhk"); // back to "all", still on Artist
         assert_eq!(app.track, 0);
         assert_eq!(app.selected_key(), Some(ItemKey::TrackArtist));
-        assert!(screen_text(&app).contains(VARIOUS));
+        assert!(screen_text(&mut app).contains(VARIOUS));
         // An untouched <various> field stays as it was.
         press(&mut app, "l");
         let before: Vec<_> = app.selection().iter().map(|t| t.draft.clone()).collect();
@@ -1581,11 +1911,11 @@ mod tests {
         let root = library("search");
         let mut app = App::new(root.clone(), Picker::halfblocks());
         assert!(!press(&mut app, "/zzq"), "typing q-free text never quits");
-        assert!(screen_text(&app).contains("no match"));
+        assert!(screen_text(&mut app).contains("no match"));
         press(&mut app, "\x1b");
         assert_eq!((app.screen, app.search.is_none()), (Screen::Albums, true));
         press(&mut app, "/ALBUM ARTIST");
-        let text = screen_text(&app);
+        let text = screen_text(&mut app);
         assert!(text.contains("▸ Album — Album Artist"), "{text}");
         assert!(text.contains("♪ Song"), "{text}");
         press(&mut app, "\n");
@@ -1606,6 +1936,7 @@ mod tests {
         let album = |album: &str, artist: &str| Album {
             artist: artist.into(),
             album: album.into(),
+            year: String::new(),
             tracks: vec![],
         };
         app.albums = vec![album("Ato", "Lamp"), album("Timely!!", "Anri")];
@@ -1613,9 +1944,116 @@ mod tests {
         press(&mut app, "s");
         assert_eq!(app.albums[0].album, "Timely!!");
         assert_eq!(app.albums[app.album_cursor].album, "Ato");
-        assert!(screen_text(&app).contains("by artist"));
+        assert!(screen_text(&mut app).contains("by artist"));
         press(&mut app, "s");
         assert_eq!((app.albums[0].album.as_str(), app.album_cursor), ("Ato", 0));
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn v_shows_albums_as_rows_with_their_cover() {
+        let root = library("album-rows");
+        let mut app = App::new(root.clone(), Picker::halfblocks());
+        assert!(screen_text(&mut app).contains("· compact "));
+        press(&mut app, "v");
+        let screen = screen_text(&mut app);
+        assert!(screen.contains("· rows "));
+        assert!(screen.contains("Album Artist · 3 tracks"));
+        assert!(app.loading > 0);
+        for _ in 0..200 {
+            app.receive_thumbs();
+            if app.loading == 0 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(app.thumbs.values().all(Option::is_some) && !app.thumbs.is_empty());
+        press(&mut app, "vv");
+        assert!(screen_text(&mut app).contains("· compact "));
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn grid_moves_by_line_and_column() {
+        let root = library("album-grid");
+        let mut app = App::new(root.clone(), Picker::halfblocks());
+        let album = |album: String| Album {
+            artist: "Lamp".into(),
+            album,
+            year: String::new(),
+            tracks: vec![],
+        };
+        app.albums = (0..7).map(|i| album(format!("A{i}"))).collect();
+        press(&mut app, "vv");
+        assert!(screen_text(&mut app).contains("· grid "));
+        // 98 cells inside the border: five 18-wide covers and four gaps of 2.
+        assert_eq!(app.tile_cols, 5);
+        press(&mut app, "j");
+        assert_eq!(app.album_cursor, 5);
+        press(&mut app, "lj");
+        assert_eq!(app.album_cursor, 6);
+        press(&mut app, "hk");
+        assert_eq!(app.album_cursor, 0);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn grid_scrolls_by_line_showing_cut_rows() {
+        let root = library("album-scroll");
+        let mut app = App::new(root.clone(), Picker::halfblocks());
+        let album = |album: String| Album {
+            artist: "Lamp".into(),
+            album,
+            year: String::new(),
+            tracks: vec![],
+        };
+        app.albums = (0..20).map(|i| album(format!("Album {i:02}"))).collect();
+        press(&mut app, "vv");
+        screen_text(&mut app);
+        // 5 columns of 12-line tiles in a 27-line view: the third row needs 9 lines more.
+        press(&mut app, "jj");
+        let screen = screen_text(&mut app);
+        assert_eq!(app.album_scroll, 9);
+        assert!(screen.contains("Album 00"), "{screen}"); // first row cut at the top
+        assert!(screen.contains("Album 10"));
+        assert!(!screen.contains("Album 15"));
+        press(&mut app, "kk");
+        screen_text(&mut app);
+        assert_eq!(app.album_scroll, 0);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn grid_size_leaves_the_least_width_unused() {
+        assert_eq!(grid_size(98), Size::new(18, 9)); // 5 × 18 + 4 × 2
+        assert_eq!(grid_size(88), Size::new(16, 8)); // 5 × 16 + 4 × 2
+        assert_eq!(grid_size(86), Size::new(20, 10)); // 4 × 20 + 3 × 2
+        assert_eq!(grid_size(10), Size::new(20, 10)); // too narrow: all tie
+    }
+
+    #[test]
+    fn settings_round_trip() {
+        let root = library("settings");
+        let mut app = App::new(root.clone(), Picker::halfblocks());
+        let defaults = app.settings();
+        press(&mut app, "vs\ts\n"); // rows, by artist, folders by date, open the folder
+        let saved = app.settings();
+        assert_eq!(
+            saved,
+            [
+                ("view", "rows"),
+                ("albums", "artist"),
+                ("folders", "date"),
+                ("screen", "folders")
+            ]
+        );
+        let text: String = saved.iter().map(|(k, v)| format!("{k}={v}\n")).collect();
+        let mut fresh = App::new(root.clone(), Picker::halfblocks());
+        fresh.apply(&config::parse(&text));
+        assert_eq!(fresh.settings(), saved);
+        let mut bad = App::new(root.clone(), Picker::halfblocks());
+        bad.apply(&config::parse("view=huge\nscreen=editor"));
+        assert_eq!(bad.settings(), defaults);
         std::fs::remove_dir_all(&root).unwrap();
     }
 
@@ -1686,7 +2124,7 @@ mod tests {
         let input = app.editing.as_ref().unwrap();
         assert_eq!(input.choices, ["Rock", "Jazz"]);
         assert_eq!(input.pick, 0);
-        assert!(screen_text(&app).contains("│Jazz"));
+        assert!(screen_text(&mut app).contains("│Jazz"));
 
         press(&mut app, "x\n"); // no invented genres
         assert!(app.editing.is_some());
@@ -1711,7 +2149,7 @@ mod tests {
         assert_eq!(input.pick, 1);
 
         press(&mut app, "Lamp");
-        assert!(screen_text(&app).contains("Lamp  (new)"));
+        assert!(screen_text(&mut app).contains("Lamp  (new)"));
         press(&mut app, "\n");
         assert_eq!(app.selected_key(), Some(ItemKey::TrackArtist));
         assert_eq!(

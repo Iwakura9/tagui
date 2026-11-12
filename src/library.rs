@@ -150,6 +150,8 @@ pub struct Row {
     pub artist: String,
     pub album: String,
     pub title: String,
+    /// The first four characters of the date ("2003-05-01" is 2003).
+    pub year: String,
     pub disc: u32,
     pub track: u32,
     /// Every genre, and every artist and album artist, one name per entry.
@@ -161,6 +163,8 @@ pub struct Row {
 pub struct Album {
     pub artist: String,
     pub album: String,
+    /// The first year any track has.
+    pub year: String,
     /// In disc, track, then path order.
     pub tracks: Vec<PathBuf>,
 }
@@ -199,6 +203,13 @@ pub fn row(path: &Path) -> Option<Row> {
         artist: artist.to_string(),
         album: text(ItemKey::AlbumTitle).to_string(),
         title: text(ItemKey::TrackTitle).to_string(),
+        year: match text(ItemKey::RecordingDate) {
+            "" => text(ItemKey::Year),
+            d => d,
+        }
+        .chars()
+        .take(4)
+        .collect(),
         disc: number(ItemKey::DiscNumber),
         track: number(ItemKey::TrackNumber),
         genres: names(ItemKey::Genre).collect(),
@@ -260,6 +271,11 @@ pub fn albums(rows: &[Row]) -> Vec<Album> {
             Album {
                 artist: rows[0].artist.clone(),
                 album: rows[0].album.clone(),
+                year: rows
+                    .iter()
+                    .map(|r| r.year.clone())
+                    .find(|y| !y.is_empty())
+                    .unwrap_or_default(),
                 tracks: rows.iter().map(|r| r.path.clone()).collect(),
             }
         })
@@ -361,6 +377,11 @@ mod tests {
             artist: artist.into(),
             album: album.into(),
             title: String::new(),
+            year: if track == 2 {
+                "2004".into()
+            } else {
+                String::new()
+            },
             disc,
             track,
             genres: vec![],
@@ -392,6 +413,7 @@ mod tests {
             .map(|p| p.to_str().unwrap())
             .collect();
         assert_eq!(order, ["z/1", "z/2", "z/10"]);
+        assert_eq!(albums[2].year, "2004");
     }
 
     #[test]
@@ -399,6 +421,7 @@ mod tests {
         let a = |artist: &str, album: &str| Album {
             artist: artist.into(),
             album: album.into(),
+            year: String::new(),
             tracks: vec![],
         };
         let mut albums = vec![
