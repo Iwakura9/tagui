@@ -36,7 +36,7 @@ then replaces the original, so a failed write never leaves a half-written file.
 
 | Where | Key | Action |
 |---|---|---|
-| anywhere | `Tab` | albums → folders → editor |
+| albums, folders | `Tab` | switch between albums and folders |
 | anywhere | `q` | quit (asks twice when there are unsaved edits) |
 | anywhere | `?` | key hints |
 | albums | `j` / `k`, `PgUp` / `PgDn` | move |
@@ -50,6 +50,7 @@ then replaces the original, so a failed write never leaves a half-written file.
 | albums, folders | `n` / `N` | next / previous match of the last search |
 | editor | `h` / `l` | focus tracks / fields |
 | editor | `j` / `k` | move |
+| editor | `Tab` | next field |
 | editor | `Enter` | edit the field |
 | editor | `d` | delete the field's value |
 | editor | `c` | embed the folder cover |

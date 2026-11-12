@@ -197,13 +197,8 @@ impl App {
         match key.code {
             KeyCode::Char('?') => self.show_help = !self.show_help,
             KeyCode::Char('s') if ctrl => self.save(),
-            KeyCode::Tab => {
-                self.screen = match self.screen {
-                    Screen::Albums => Screen::Folders,
-                    Screen::Folders if self.open.is_some() => Screen::Editor,
-                    _ => Screen::Albums,
-                }
-            }
+            KeyCode::Tab if self.screen == Screen::Albums => self.screen = Screen::Folders,
+            KeyCode::Tab if self.screen == Screen::Folders => self.screen = Screen::Albums,
             code => match self.screen {
                 Screen::Albums => self.albums_key(code),
                 Screen::Folders => self.folders_key(code),
@@ -498,6 +493,10 @@ impl App {
             }
             KeyCode::Up | KeyCode::Char('k') => self.field = (self.field + fields - 1) % fields,
             KeyCode::Down | KeyCode::Char('j') => self.field = (self.field + 1) % fields,
+            KeyCode::Tab => {
+                self.focus_tracks = false;
+                self.field = (self.field + 1) % fields;
+            }
             KeyCode::Enter => self.start_edit(),
             KeyCode::Char('d') => self.clear_field(),
             KeyCode::Char('c') => self.stage_cover(),
@@ -721,7 +720,7 @@ impl App {
                 ("n/N", "next"),
                 ("s", "sort"),
                 ("←→", "fold"),
-                ("tab", "editor"),
+                ("tab", "albums"),
                 ("q", "quit"),
             ],
             Screen::Editor => &[
@@ -1470,6 +1469,9 @@ mod tests {
         assert_eq!(app.screen, Screen::Folders);
         press(&mut app, "ljj\n"); // expand Album, go to its second file
         assert_eq!(app.screen, Screen::Editor);
+        let field = app.field;
+        app.key(KeyEvent::from(KeyCode::Tab)); // next field, still in the editor
+        assert_eq!((app.screen, app.field), (Screen::Editor, field + 1));
         assert_eq!(app.open.as_ref().unwrap().tracks.len(), 3);
         assert_eq!(app.selection()[0].path, root.join("Album/tiny.m4a"));
         press(&mut app, "\x1b");
@@ -1479,6 +1481,8 @@ mod tests {
             app.tree.selected().unwrap().path,
             root.join("Album/tiny.mp3")
         );
+        app.key(KeyEvent::from(KeyCode::Tab));
+        assert_eq!(app.screen, Screen::Albums);
         std::fs::remove_dir_all(&root).unwrap();
     }
 
