@@ -3,3 +3,4 @@
 pub mod cli;
 pub mod library;
 pub mod tags;
+pub mod tui;

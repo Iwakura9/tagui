@@ -19,7 +19,7 @@ pub fn run() -> Result<()> {
     if !dir.is_dir() {
         bail!("{} is not a directory", dir.display());
     }
-    Ok(())
+    crate::tui::run(dir)
 }
 
 fn default_dir() -> Result<PathBuf> {
