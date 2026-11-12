@@ -143,7 +143,21 @@ impl Track {
     }
 
     pub fn dirty(&self) -> bool {
-        self.draft != self.saved || self.new_cover.is_some()
+        !self.changed().is_empty() || self.new_cover.is_some()
+    }
+
+    /// Fields whose draft value differs from the saved one (absent counts as empty).
+    pub fn changed(&self) -> Vec<ItemKey> {
+        let mut keys: Vec<ItemKey> = self
+            .saved
+            .keys()
+            .chain(self.draft.keys())
+            .copied()
+            .collect();
+        keys.retain(|k| get(&self.draft, *k) != get(&self.saved, *k));
+        keys.sort_by_key(|k| format!("{k:?}"));
+        keys.dedup();
+        keys
     }
 
     /// Drop the draft and the pending cover.
@@ -185,14 +199,11 @@ impl Track {
             .primary_tag()
             .cloned()
             .unwrap_or_else(|| Tag::new(file.primary_tag_type()));
-        for key in self.saved.keys().chain(self.draft.keys()) {
-            let new = get(&self.draft, *key);
-            if new == get(&self.saved, *key) {
-                continue;
-            }
-            tag.remove_key(*key);
-            if !new.is_empty() && !tag.insert_text(*key, new.to_string()) {
-                bail!("{} files can't hold {}", self.info.ext, label(*key));
+        for key in self.changed() {
+            let new = get(&self.draft, key);
+            tag.remove_key(key);
+            if !new.is_empty() && !tag.insert_text(key, new.to_string()) {
+                bail!("{} files can't hold {}", self.info.ext, label(key));
             }
         }
         if let Some(data) = &self.new_cover {
@@ -364,6 +375,17 @@ mod tests {
             std::fs::read_dir(path.parent().unwrap()).unwrap().count(),
             1
         );
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn empty_and_absent_are_the_same() {
+        let path = copy("tiny.flac", "empty");
+        let mut t = Track::load(&path).unwrap();
+        t.draft.insert(ItemKey::Composer, String::new());
+        assert!(!t.dirty());
+        t.draft.insert(ItemKey::Genre, String::new());
+        assert_eq!(t.changed(), [ItemKey::Genre]);
         std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
 
