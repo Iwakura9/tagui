@@ -51,7 +51,7 @@ then replaces the original, so a failed write never leaves a half-written file.
 | editor | `h` / `l` | focus tracks / fields |
 | editor | `j` / `k` | move |
 | editor | `Tab` | next field |
-| editor | `Enter` | edit the field |
+| editor | `Enter` | edit the field (Genre: pick one of the library's genres, typing filters, `↑` / `↓` choose) |
 | editor | `d` | delete the field's value |
 | editor | `c` | embed the folder cover |
 | editor | `u` | undo (back to the saved tags) |
