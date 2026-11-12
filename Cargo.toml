@@ -1,0 +1,19 @@
+[package]
+name = "tagui"
+version = "0.1.0"
+edition = "2021"
+description = "Terminal editor for music tags, browsed by album or folder"
+license = "MIT"
+repository = "https://github.com/Iwakura9/tagui"
+readme = "README.md"
+keywords = ["tags", "metadata", "music", "tui", "audio"]
+categories = ["command-line-utilities", "multimedia::audio"]
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+anyhow = "1"
+ratatui = "0.30"
+crossterm = "0.29"
+lofty = "0.25"
+ratatui-image = { version = "11", default-features = false, features = ["crossterm", "image-defaults"] }
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
