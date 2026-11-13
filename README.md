@@ -1,5 +1,7 @@
 # tagui
 
+![tagui](assets/cover.png)
+
 A terminal editor for music tags. Browse your library by album or by folder, open a
 whole album (or folder) at once, and edit its tags in a draft that is only written on
 save.
@@ -7,8 +9,10 @@ save.
 ## Install
 
 ```sh
-cargo install --path .
+cargo install --git https://github.com/Iwakura9/tagui --locked
 ```
+
+or, from a clone, `cargo install --path . --locked`.
 
 ## Usage
 
@@ -40,15 +44,16 @@ then replaces the original, so a failed write never leaves a half-written file.
 | Where | Key | Action |
 |---|---|---|
 | albums, folders | `Tab` | switch between albums and folders |
-| anywhere | `q` | quit (asks twice when there are unsaved edits) |
+| anywhere | `q`, `Ctrl+c` | quit (asks twice when there are unsaved edits) |
 | anywhere | `?` | key hints |
-| albums | `j` / `k`, `PgUp` / `PgDn` | move |
+| albums | `j` / `k`, `PgUp` / `PgDn`, `Home` / `End` | move |
 | albums | `Enter` | open the album |
 | albums, folders | `/` | search albums (or folders) and songs: `Enter` opens the result in the editor, `Tab` goes to it in the list, `Esc` closes |
 | albums | `s` | sort by album / by artist |
 | albums | `v` | view: compact list / rows with the cover / grid of covers |
 | albums | `h` / `l` | move left / right (grid) |
-| folders | `←` / `→` | collapse / expand |
+| folders | `j` / `k`, `PgUp` / `PgDn` | move |
+| folders | `h` / `l`, `←` / `→` | collapse / expand |
 | folders | `Enter` | open the folder's tracks (on a file: its folder, at that track) |
 | folders | `s` | sort by name / newest first (modification time) |
 | editor | `h` / `l` | focus tracks / fields |
@@ -64,8 +69,9 @@ then replaces the original, so a failed write never leaves a half-written file.
 ## Development
 
 ```sh
-cargo test --all-targets
-cargo clippy --all-targets -- -D warnings
+cargo test --all-targets --locked
+cargo clippy --all-targets --locked -- -D warnings
+cargo fmt --all -- --check
 ```
 
 `tests/fixtures/make.sh` regenerates the tiny test files (needs ffmpeg and mutagen).
